@@ -2227,6 +2227,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                                 )
                             except Exception:
                                 pass
+                            # Exponential backoff between stream retries:
+                            # 2s, 4s, 8s, 16s, ... caps at 32s.
+                            # Gives vLLM time to recover from KV-cache pressure.
+                            _retry_delay = min(2 ** _stream_attempt, 32)
+                            agent._log_event(
+                                f"Stream retry {_stream_attempt + 1}/{_max_stream_retries}: "
+                                f"waiting {_retry_delay}s before next attempt"
+                            )
+                            import time as _time
+                            _time.sleep(_retry_delay)
                             continue
                         # Retries exhausted. Log the final failure with
                         # full diagnostic detail (chain, headers,
