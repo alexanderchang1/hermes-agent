@@ -756,9 +756,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     if wrap_response:
         task_name = job.get("name", job["id"])
         job_id = job.get("id", "")
+        delivery_time = _hermes_now().strftime('%Y-%m-%d %H:%M:%S UTC')
         delivery_content = (
             f"Cronjob Response: {task_name}\n"
             f"(job_id: {job_id})\n"
+            f"(run time: {delivery_time})\n"
             f"-------------\n\n"
             f"{content}\n\n"
             f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
@@ -2090,7 +2092,11 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                 # Deliver the final response to the origin/target chat.
                 # If the agent responded with [SILENT], skip delivery (but
                 # output is already saved above).  Failed jobs always deliver.
-                deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
+                run_time = _hermes_now().strftime('%Y-%m-%d %H:%M:%S %Z')
+                if success:
+                    deliver_content = final_response
+                else:
+                    deliver_content = f"⚠️ Cron job '{job.get('name', job['id'])}' failed at {run_time}:\n{error}"
                 # Treat whitespace-only final responses the same as empty
                 # responses: do not deliver a blank message, and let the
                 # empty-response guard below mark the run as a soft failure.
