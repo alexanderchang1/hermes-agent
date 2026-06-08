@@ -886,6 +886,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 )
 
         if not delivered:
+            # Guard: if the Python interpreter is shutting down, asyncio.run() and
+            # the Telegram bot's internal asyncio calls will fail with
+            # "cannot schedule new futures after interpreter shutdown".  Skip
+            # delivery gracefully rather than logging a spurious error.
+            if sys.is_finalizing():
+                msg = f"delivery to {platform_name}:{chat_id} skipped: interpreter shutting down"
+                logger.info("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+                continue
+
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
             coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
             try:
@@ -906,7 +916,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 continue
 
             if result and result.get("error"):
-                msg = f"delivery error: {result['error']}"
+                err_text = result["error"]
+                # Interpreter-shutdown errors are benign — the delivery attempt
+                # collided with process teardown.  Log at INFO (not ERROR) and
+                # skip without surfacing as a delivery_error in the job record.
+                if "cannot schedule new futures after interpreter shutdown" in err_text:
+                    msg = f"delivery to {platform_name}:{chat_id} skipped: {err_text}"
+                    logger.info("Job '%s': %s", job["id"], msg)
+                    continue
+                msg = f"delivery error: {err_text}"
                 logger.error("Job '%s': %s", job["id"], msg)
                 delivery_errors.append(msg)
                 continue
