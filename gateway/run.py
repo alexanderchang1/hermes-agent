@@ -1947,6 +1947,14 @@ class GatewayRunner:
         self._session_sources: "OrderedDict[str, SessionSource]" = OrderedDict()
         self._session_sources_max = 512
 
+        # Protect against "missing last assistant message" when the agent
+        # crashes or delivery times out before _persist_session finishes.
+        # Key: session_key, Value: assistant text from the most recent turn.
+        # On the next inbound message, if the loaded transcript does not end
+        # with an assistant message, this cache is used to re-inject the
+        # orphaned response so the model doesn't "forget" what it said.
+        self._last_assistance_response: Dict[str, str] = {}
+
         # Cache AIAgent instances per session to preserve prompt caching.
         # Without this, a new AIAgent is created per message, rebuilding the
         # system prompt (including memory) every turn — breaking prefix cache
@@ -9089,7 +9097,47 @@ class GatewayRunner:
 
         # Load conversation history from transcript
         history = self.session_store.load_transcript(session_entry.session_id)
-        
+
+        # Recover orphaned assistant messages.  If the agent produced a
+        # response last turn but crashed before _persist_session could write
+        # it to the transcript, the next message arrives here with no
+        # assistant message at the end of history.  Detect that case and
+        # re-inject the cached response so the model sees what it "said."
+        if session_key and session_key in self._last_assistance_response:
+            _cached_response = self._last_assistance_response[session_key]
+            # Only inject if the loaded transcript truly lacks the assistant
+            # message (empty history or last message is not assistant).
+            _last_is_assistant = False
+            for _m in reversed(history):
+                if _m.get("role") == "assistant":
+                    _last_is_assistant = True
+                    break
+            if not _last_is_assistant and _cached_response.strip():
+                logger.warning(
+                    "Recovering orphaned assistant message for session %s "
+                    "(transcript ends at %d messages, appending cached response)",
+                    session_key, len(history),
+                )
+                # Insert right after the last non-system message so the
+                # conversation order is maintained.
+                _insert_after = None
+                for _hm in reversed(history):
+                    if _hm.get("role") != "system":
+                        _insert_after = _hm
+                        break
+                if _insert_after is not None:
+                    _insert_idx = history.index(_insert_after) + 1
+                    history.insert(
+                        _insert_idx,
+                        {"role": "assistant", "content": _cached_response},
+                    )
+                else:
+                    history.insert(0, {"role": "assistant", "content": _cached_response})
+            else:
+                # Transcript already has the assistant message — cache was
+                # successfully persisted last time. Clear it to free memory.
+                self._last_assistance_response.pop(session_key, None)
+
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
         #
@@ -9576,6 +9624,12 @@ class GatewayRunner:
                 agent_result, response, history_len=len(history),
             )
             response = _sanitize_gateway_final_response(source.platform, response)
+
+            # Cache the response per session_key so the next turn can
+            # recover it if _persist_session crashed and never wrote
+            # the assistant message to the transcript.
+            if response and session_key:
+                self._last_assistance_response[session_key] = response
 
             # If the agent's session_id changed during compression, update
             # session_entry so transcript writes below go to the right session.
@@ -10123,6 +10177,10 @@ class GatewayRunner:
         self._set_session_reasoning_override(session_key, None)
         if hasattr(self, "_pending_model_notes"):
             self._pending_model_notes.pop(session_key, None)
+
+        # Clear orphaned response cache so stale messages don't inject
+        # into the fresh session.
+        self._last_assistance_response.pop(session_key, None)
 
         # Clear session-scoped dangerous-command approvals and /yolo state.
         # /new is a conversation-boundary operation — approval state from the
@@ -11605,6 +11663,36 @@ class GatewayRunner:
         except Exception:
             return 20
 
+    def _goal_continuation_delay(self) -> int:
+        """Resolve the configured delay (seconds) between goal judge
+        "continue" verdict and the continuation prompt being enqueued.
+
+        Reads ``goals.continuation_delay_seconds`` from config.
+        Returns 0 if the key is missing or invalid (instant-fire).
+        """
+        try:
+            goals_cfg = (
+                (self.config or {}).get("goals", {})
+                if isinstance(self.config, dict)
+                else getattr(self.config, "goals", {}) or {}
+            )
+            if not goals_cfg:
+                from hermes_cli.config import load_config
+
+                goals_cfg = (load_config() or {}).get("goals") or {}
+            delay = goals_cfg.get("continuation_delay_seconds")
+            if delay is None:
+                # Default from DEFAULT_CONFIG
+                from hermes_cli.config import DEFAULT_CONFIG
+
+                delay = (DEFAULT_CONFIG.get("goals") or {}).get(
+                    "continuation_delay_seconds", 0
+                )
+            delay = int(delay or 0)
+            return max(0, delay)
+        except Exception:
+            return 0
+
     def _get_goal_manager_for_event(self, event: "MessageEvent"):
         """Return a GoalManager bound to the session for this gateway event.
 
@@ -11868,6 +11956,28 @@ class GatewayRunner:
         prompt = decision.get("continuation_prompt") or ""
         if not prompt or source is None:
             return
+
+        # Cooldown: delay before firing the continuation prompt.
+        # Lets in-flight user messages land (they preempt the goal loop)
+        # and prevents instant-fire loops.
+        delay = self._goal_continuation_delay()
+        if delay > 0:
+            logger.debug(
+                "goal continuation: %ds cooldown delay for session %s",
+                delay, sid,
+            )
+            await asyncio.sleep(delay)
+
+        # Re-check goal is still active after the cooldown (user may have
+        # paused/cleared it while we were sleeping).
+        try:
+            from hermes_cli.goals import GoalManager
+            recheck = GoalManager(session_id=sid, default_max_turns=max_turns)
+            if not recheck.is_active():
+                logger.debug("goal continuation: goal no longer active after cooldown")
+                return
+        except Exception as exc:
+            logger.debug("goal continuation: post-delay recheck failed: %s", exc)
 
         # Enqueue via the adapter's FIFO so a user message already in
         # flight preempts the continuation naturally.
