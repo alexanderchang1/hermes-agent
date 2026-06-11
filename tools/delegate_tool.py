@@ -2857,4 +2857,5 @@ registry.register(
     check_fn=check_delegate_requirements,
     emoji="🔀",
     dynamic_schema_overrides=_build_dynamic_schema_overrides,
+    max_result_size_chars=30_000,
 )
