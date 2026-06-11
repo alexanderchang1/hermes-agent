@@ -71,9 +71,12 @@ DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
 CONTINUATION_PROMPT_TEMPLATE = (
     "[Continuing toward your standing goal]\n"
     "Goal: {goal}\n\n"
-    "Continue working toward this goal. Take the next concrete step. "
-    "If you believe the goal is complete, state so explicitly and stop. "
-    "If you are blocked and need input from the user, say so clearly and stop."
+    "{judge_context}"
+    "Continue working toward this goal. Take the next concrete step, "
+    "focusing on the remaining work identified above. Avoid repeating "
+    "work you've already done this turn. If you believe the goal is "
+    "complete, state so explicitly and stop. If you are blocked and "
+    "need input from the user, say so clearly and stop."
 )
 
 # Used when the user has added one or more /subgoal criteria. Surfaced
@@ -84,33 +87,47 @@ CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "Goal: {goal}\n\n"
     "Additional criteria the user added mid-loop:\n"
     "{subgoals_block}\n\n"
+    "{judge_context}"
     "Continue working toward the goal AND all additional criteria. Take "
-    "the next concrete step. If you believe the goal and every "
-    "additional criterion are complete, state so explicitly and stop. "
-    "If you are blocked and need input from the user, say so clearly "
-    "and stop."
+    "the next concrete step, focusing on the remaining work identified "
+    "above. Avoid repeating work you've already done. If you believe the "
+    "goal and every additional criterion are complete, state so "
+    "explicitly and stop. If you are blocked and need input from the "
+    "user, say so clearly and stop."
 )
 
 
 JUDGE_SYSTEM_PROMPT = (
     "You are a strict judge evaluating whether an autonomous agent has "
-    "achieved a user's stated goal. You receive the goal text and the "
-    "agent's most recent response. Your only job is to decide whether "
-    "the goal is fully satisfied based on that response.\n\n"
-    "A goal is DONE only when:\n"
+    "achieved a user's stated goal. You receive the goal text, the agent's "
+    "most recent response, and optionally the judge's reason from the "
+    "previous turn. Your job is to decide whether the goal is fully "
+    "satisfied.\n\n"
+    "A goal is DONE when:\n"
     "- The response explicitly confirms the goal was completed, OR\n"
     "- The response clearly shows the final deliverable was produced, OR\n"
     "- The response explains the goal is unachievable / blocked / needs "
     "user input (treat this as DONE with reason describing the block).\n\n"
-    "Otherwise the goal is NOT done — CONTINUE.\n\n"
+    "STALL DETECTION: You may also receive the judge's reason from the "
+    "previous turn. If the previous reason already noted the agent was "
+    "working on the same sub-task and the current response shows no "
+    "concrete new progress (same tool calls, same intermediate state, "
+    "no new files produced, no error resolved), treat the goal as DONE "
+    "with reason describing the stall. Do not let the agent loop "
+    "indefinitely on the same step.\n\n"
+    "When in doubt between DONE and CONTINUE for a multi-step goal where "
+    "the agent produced partial output and is clearly mid-process, prefer "
+    "CONTINUE — but only if the response contains SUBSTANTIVE new work, "
+    "not just narration or the same intermediate step repeated.\n\n"
     "Reply ONLY with a single JSON object on one line:\n"
-    '{\"done\": <true|false>, \"reason\": \"<one-sentence rationale>\"}'
+    '{"done": <true|false>, "reason": "<one-sentence rationale>"}'
 )
 
 
 JUDGE_USER_PROMPT_TEMPLATE = (
     "Goal:\n{goal}\n\n"
     "Agent's most recent response:\n{response}\n\n"
+    "{previous_verdict_block}"
     "Current time: {current_time}\n\n"
     "Is the goal satisfied?"
 )
@@ -122,6 +139,7 @@ JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "Additional criteria the user added mid-loop (all must also be "
     "satisfied for the goal to be DONE):\n{subgoals_block}\n\n"
     "Agent's most recent response:\n{response}\n\n"
+    "{previous_verdict_block}"
     "Current time: {current_time}\n\n"
     "Decision: For each numbered criterion above, find concrete "
     "evidence in the agent's response that the criterion is "
@@ -374,6 +392,7 @@ def judge_goal(
     *,
     timeout: float = DEFAULT_JUDGE_TIMEOUT,
     subgoals: Optional[List[str]] = None,
+    previous_verdict_reason: str = "",
 ) -> Tuple[str, str, bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -390,6 +409,10 @@ def judge_goal(
     ``/subgoal``) that the judge must also factor into its DONE/CONTINUE
     decision. When non-empty the prompt switches to the with-subgoals
     template; otherwise behavior is identical to the original judge.
+
+    ``previous_verdict_reason`` is the judge's reason string from the
+    previous turn. When provided the judge prompt includes it so the
+    judge can detect stalls (same sub-task repeated with no new output).
 
     This is deliberately fail-open: any error returns ``("continue", "...", False)``
     so a broken judge doesn't wedge progress — the turn budget and the
@@ -419,6 +442,16 @@ def judge_goal(
     # Build the prompt — pick the with-subgoals variant when applicable.
     clean_subgoals = [s.strip() for s in (subgoals or []) if s and s.strip()]
     current_time = datetime.now(tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+    # Build the previous verdict context for stall detection.
+    if previous_verdict_reason and previous_verdict_reason.strip():
+        previous_verdict_block = (
+            "Previous turn judge reason (for stall detection):\n"
+            f"The judge previously said: {previous_verdict_reason}\n\n"
+        )
+    else:
+        previous_verdict_block = ""
+
     if clean_subgoals:
         subgoals_block = "\n".join(
             f"- {i}. {text}" for i, text in enumerate(clean_subgoals, start=1)
@@ -427,12 +460,14 @@ def judge_goal(
             goal=_truncate(goal, 2000),
             subgoals_block=_truncate(subgoals_block, 2000),
             response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
+            previous_verdict_block=previous_verdict_block,
             current_time=current_time,
         )
     else:
         prompt = JUDGE_USER_PROMPT_TEMPLATE.format(
             goal=_truncate(goal, 2000),
             response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
+            previous_verdict_block=previous_verdict_block,
             current_time=current_time,
         )
 
@@ -653,7 +688,8 @@ class GoalManager:
         state.last_turn_at = time.time()
 
         verdict, reason, parse_failed = judge_goal(
-            state.goal, last_response, subgoals=state.subgoals or None
+            state.goal, last_response, subgoals=state.subgoals or None,
+            previous_verdict_reason=state.last_reason or "",
         )
         state.last_verdict = verdict
         state.last_reason = reason
@@ -728,7 +764,7 @@ class GoalManager:
         return {
             "status": "active",
             "should_continue": True,
-            "continuation_prompt": self.next_continuation_prompt(),
+            "continuation_prompt": self.next_continuation_prompt(reason),
             "verdict": "continue",
             "reason": reason,
             "message": (
@@ -736,15 +772,25 @@ class GoalManager:
             ),
         }
 
-    def next_continuation_prompt(self) -> Optional[str]:
+    def next_continuation_prompt(self, judge_reason: str = "") -> Optional[str]:
         if not self._state or self._state.status != "active":
             return None
+        # Build judge context for the continuation prompt so the agent
+        # knows what the judge thinks is still missing.
+        if judge_reason and judge_reason.strip():
+            judge_context = f"The judge noted this remains: {judge_reason}\n\n"
+        else:
+            judge_context = ""
         if self._state.subgoals:
             return CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
                 goal=self._state.goal,
                 subgoals_block=self._state.render_subgoals_block(),
+                judge_context=judge_context,
             )
-        return CONTINUATION_PROMPT_TEMPLATE.format(goal=self._state.goal)
+        return CONTINUATION_PROMPT_TEMPLATE.format(
+            goal=self._state.goal,
+            judge_context=judge_context,
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────

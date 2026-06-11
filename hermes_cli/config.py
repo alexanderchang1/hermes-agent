@@ -1711,6 +1711,12 @@ DEFAULT_CONFIG = {
         # negatives (goal actually done but judge says continue) and
         # unbounded model spend on fuzzy / unachievable goals.
         "max_turns": 20,
+        # Delay in seconds between the judge deciding "continue" and the
+        # continuation prompt being enqueued.  Prevents the goal loop from
+        # firing blindly fast; a small gap lets in-flight user messages
+        # land and gives the judge's verdict time to actually flush through.
+        # Set to 0 to disable (previous instant-fire behavior).
+        "continuation_delay_seconds": 15,
     },
 
     # Skills — external skill directories for sharing skills across tools/agents.
