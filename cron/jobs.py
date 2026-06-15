@@ -931,7 +931,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 
                 # Increment completed count
                 if job.get("repeat"):
-                    job["repeat"]["completed"] = job["repeat"].get("completed", 0) + 1
+                    job["repeat"]["completed"] = (job["repeat"].get("completed") or 0) + 1
                     
                     # Check if we've hit the repeat limit
                     times = job["repeat"].get("times")
