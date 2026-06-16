@@ -664,8 +664,14 @@ class ChatCompletionsTransport(ProviderTransport):
         if rd:
             provider_data["reasoning_details"] = rd
 
+        # Thinking models (Qwen, DeepSeek) put output in reasoning with content=null.
+        # Fall back so the response is actually usable.
+        effective_content = msg.content
+        if not effective_content and reasoning:
+            effective_content = reasoning
+
         return NormalizedResponse(
-            content=msg.content,
+            content=effective_content,
             tool_calls=tool_calls,
             finish_reason=finish_reason,
             reasoning=reasoning,
