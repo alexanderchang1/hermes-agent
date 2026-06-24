@@ -1,0 +1,32 @@
+{
+  "goals": [
+    {
+      "id": "goal-e76962f6",
+      "window": 3,
+      "description": "Drive TUSV benchmarking to completion",
+      "auto_level": "heavy",
+      "active": true,
+      "created": "2026-06-21T03:06:39.158067+00:00",
+      "last_progress": "State changed: blocked_waiting \u2192 working",
+      "progress_count": 50,
+      "check_interval": 3,
+      "completed": false,
+      "stale_timer": 115,
+      "last_state": "working"
+    },
+    {
+      "id": "goal-e0211c79",
+      "window": 7,
+      "description": "Iterate on Digital Organoid - analyze benchmark results and progress project",
+      "auto_level": "heavy",
+      "active": true,
+      "created": "2026-06-21T03:06:39.298536+00:00",
+      "last_progress": "State changed: working \u2192 subagent_menu",
+      "progress_count": 115,
+      "check_interval": 3,
+      "completed": true,
+      "stale_timer": 0,
+      "last_state": "subagent_menu"
+    }
+  ]
+}

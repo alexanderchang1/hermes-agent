@@ -1,0 +1,138 @@
+{
+  "jobs": [
+    {
+      "id": "c16568fa305c",
+      "name": "Hermes Supervisor Fleet Check",
+      "prompt": "You are the Hermes Fleet Supervisor. The script output below tells you what action to take.\n\n## SILENT\nScript output is `LOGGED` or similar. Simply output:\n```\nLOGGED\n```\n\n## FLEET REPORT\nScript output starts with `Fleet Report`. Compose a natural-language fleet status report using this format:\n\n**Example (GOOD):**\n```\nFleet Report \u2014 2026-06-15 19:00 UTC\n\nW1 CITEgeist: [subagent_menu] \u2014 active in subagent workflow, working.\nW3 TUSV-ext: [working] \u2014 heavy code review subagent deliberating (56m), expected.\nW4 SpleenSpatialAnalysis: [blocked_waiting \u2192 directed] \u2014 was at multi-choice menu after Codex review. Directed agent to fix semantics bug first, then build spatial pseudobulk re-test.\nW5 Path2Space: [working] \u2014 manifesting task (9m), active.\n\nActions (last 15 min):\n- W4: Resolved multi-choice menu \u2014 directed agent to proceed with option 1 (semantics fix) then option 2 (spatial pseudobulk re-test). Codex review was already completed via Azure GPT-5.5 (quota-exhausted fallback).\n\nNeeds Attention: None\n\nSLURM: 0 running, 0 pending\n```\n\n**Style guide:**\n- Write each window as one natural sentence explaining what's happening\n- Use contextual language: \"working on...\", \"monitoring...\", \"idle awaiting...\", \"blocked waiting for...\"\n- Include idle/waiting durations where tracked: \"(45m idle)\"\n- Include context % if visible: \"(22% ctx)\"\n- End with:\n  - Actions (last 15 min): [summarize or \"None\"]\n  - Needs Attention: [list or \"None\"]  \n  - SLURM: [from script data]\n- SKIP infra windows (W0, W2)\n- Check for active goals: read `~/.hermes/scripts/supervisor-goals.json` \u2192 list active goals with progress\n- Include goal status in Needs Attention if goals are stalled\\n- Active Goals: list each goal with window, short name, progress (steps), and status label from script data\\n  - Status labels: \"progressing\", \"blocked\", \"completed\", \"failed\", \"awaiting review\"\n\n\n## GOAL_ACTIONS (script starts with `GOAL_ACTIONS cycle=N`)\nGoal-driven actions from the resolver. For each action line:\n1. Parse the window number and action: e.g. `W4: proceed \u2014 Goal goal-abc123 active, blocked waiting \u2014 sending proceed to unblock`\n2. Execute the appropriate tmux-act.sh command:\n   - For \"proceed\" actions: `~/.hermes/scripts/tmux-act.sh submit_proceed W=N`\n   - For \"send\" actions: `~/.hermes/scripts/tmux-act.sh send_text W=N TEXT=\"message\"`\n   - For \"capture\" actions: `~/.hermes/scripts/tmux-act.sh capture W=N`\n3. Log every action: `~/.hermes/scripts/tmux-act.sh append_log TEXT \"W{N}: goal action \u2014 {action description}\"`\n4. Output `LOGGED`\n\nIf any action fails, output `NEEDS ATTENTION: W{n}: goal action failed \u2014 <error detail>`\n\nGoal line format: `W{N}: {action} \u2014 Goal {goal_id} {status}`\\n\\n## GOAL_ACTIONS (script starts with `GOAL_ACTIONS`)\nActive supervisor goals need auto-unblocking. For each listed action:\n1. Capture pane: `~/.hermes/scripts/tmux-act.sh capture W=N`\n2. If action is \"proceed\": `~/.hermes/scripts/tmux-act.sh submit_proceed W=N`\n3. If action is \"approve_default\": `~/.hermes/scripts/tmux-act.sh approve_default W=N`\n4. Log: `~/.hermes/scripts/tmux-act.sh append_log TEXT \"Goal auto-action: W{N} {action} \u2014 {reason}\"`\n5. Output: `LOGGED`\n\n\n## ESCALATION (script starts with `ESCALATION`)\nAgent windows need cockpit action. For each listed window:\n1. Capture pane: `~/.hermes/scripts/tmux-act.sh capture W=N`\n2. Read what the agent is blocked on\n3. If simple yes/no or menu: answer directly\n4. If scientific/domain: read vault \u2192 delegate to Codex \u2192 decide \u2192 act\n5. \u26a0 If `USER ACTIVE ON W...` is listed: skip those specific windows, handle others\n6. After acting: `~/.hermes/scripts/tmux-act.sh append_log TEXT \"...\"` Output: `NEEDS ATTENTION: W{n}: <one-line summary>` if truly stuck, otherwise `LOGGED`.\n\n## WRAPUP (script starts with `WRAPUP`)\nWindow(s) have been idle 60+ min. For each:\n1. Capture pane: `~/.hermes/scripts/tmux-act.sh capture W=N`\n2. Decide:\n   - Pane shows cleared/empty session (no history) \u2192 SKIP, run `~/.hermes/scripts/mark-window-cleared.sh W{n}`\n   - Pane shows session complete with no active work \u2192 send `/wrap-up`, then `~/.hermes/scripts/mark-wrapup-sent.sh W{n}`\n   - Pane shows active work (plans, reviews, GLPK, etc.) \u2192 SKIP, just log\n3. Log: `~/.hermes/scripts/tmux-act.sh append_log TEXT \"...\"`\n4. Output: `LOGGED`\n\n## IDLE_NUDGE (script starts with `IDLE_NUDGE`)\nWindow(s) stuck 45+ min. For each:\n1. Capture pane: `~/.hermes/scripts/tmux-act.sh capture W=N`\n2. If spinning/has goal: send \"proceed\" to resume\n3. If truly stuck/bare prompt: output `NEEDS ATTENTION: W{n}: <issue>`\n4. Log: `~/.hermes/scripts/tmux-act.sh append_log TEXT \"...\"`\n5. Output: `LOGGED` if nudged successfully.\n\n## HIGH_CTX (script starts with `HIGH_CTX`)\nWindow(s) approaching context limits (>40% used). For each listed window:\n1. Capture pane: `~/.hermes/scripts/tmux-act.sh capture W=N`\n2. Send `/wrap-up` to preserve context: `~/.hermes/scripts/tmux-act.sh submit_text W=N TEXT=\"/wrap-up\"`\n3. Then send `/clear` to reset context: `~/.hermes/scripts/tmux-act.sh submit_text W=N TEXT=\"/clear\"`\n4. Then send `/orient` to re-orient: `~/.hermes/scripts/tmux-act.sh submit_text W=N TEXT=\"/orient\"`\n5. Then send `/brainstorming` to restart: `~/.hermes/scripts/tmux-act.sh submit_text W=N TEXT=\"/brainstorming\"`\n6. Log: `~/.hermes/scripts/tmux-act.sh append_log TEXT \"HIGH_CTX refresh: W{n} at {ctx}%\"`\n7. Output: `LOGGED`\n\n## NATURAL_END (script starts with `NATURAL_END`)\nWindow finished its task but still appears \"working\" due to monitors. The session is done \u2014 it needs the fresh restart sequence.\nFor each listed window:\n1. Capture pane: `~/.hermes/scripts/tmux-act.sh capture W=N`\n2. Check the `needs_wrapup_first` flag:\n   - If `needs_wrapup_first` is TRUE: send ONLY `/wrap-up`: `~/.hermes/scripts/tmux-act.sh submit_text W=N TEXT=\"/wrap-up\"` \u2014 then output `LOGGED` and wait for next cycle\n   - If `needs_wrapup_first` is FALSE (wrap-up already sent): proceed with the full sequence:\n     a. Send `/clear`: `~/.hermes/scripts/tmux-act.sh submit_text W=N TEXT=\"/clear\"`\n     b. Send `/orient`: `~/.hermes/scripts/tmux-act.sh submit_text W=N TEXT=\"/orient\"`\n     c. Send `/brainstorming`: `~/.hermes/scripts/tmux-act.sh submit_text W=N TEXT=\"/brainstorming\"`\n3. Log: `~/.hermes/scripts/tmux-act.sh append_log TEXT \"NATURAL_END refresh: W{n} sat idle {m}min\"`\n4. Output: `LOGGED`\n\n## CODEX_RESOLVE (script starts with `CODEX_RESOLVE`)\nWindow(s) stuck >30min with no user response. Claude Code is the main driver \u2014 Codex is the decision point resolver only.\nFor each listed window:\n1. Capture pane: `~/.hermes/scripts/tmux-act.sh capture W=N`\n2. Read the question from the CODEX_RESOLVE output line (it includes `question=<the actual question text>`)\n3. Run Codex in the project working directory, passing the captured pane and question explicitly:\n   ```\n   cd /ix1/alee/LO_LAB/Personal/Alexander_Chang/alc376/<ProjectDir>\n   codex exec --full-auto 'The following decision is blocking this Claude Code agent:\n   [PASTE THE QUESTION FROM STEP 2 HERE]\n   Analyze the codebase and decide the best answer. Return ONLY one of: YES, NO, CHOOSE 1, CHOOSE 2, CHOOSE 3, CHOOSE 4, PROCEED'\n   ```\n4. Parse Codex's response and take the action in Claude Code:\n   - YES \u2192 send \"1\" then Enter\n   - NO \u2192 send \"2\" then Enter\n   - CHOOSE N \u2192 send \"N\" then Enter\n   - PROCEED \u2192 send \"proceed\" then Enter\n5. Log: `~/.hermes/scripts/tmux-act.sh append_log TEXT \"CODEX_RESOLVE: W{n} \u2014 user absent, Codex decided {action}\"`\n6. Output: `LOGGED`\n\n## PRIORITY: GOAL_ACTIONS > CODEX_RESOLVE > HIGH_CTX > ESCALATION > WRAPUP > IDLE_NUDGE > REPORT > SILENT\n\n## HARD RULES\n- W0, W2 are infrastructure \u2014 never act on them\n- NEVER send bare numbers (1, 2, 3) \u2014 always textual\n- NEVER send /wrap-up to a cleared/empty session\n- Always capture before acting\n- Review gate: if agent is at spec\u2192plan or plan\u2192execution transition, ensure Codex review happened \u2014 if not, halt and require it\n\n## OUTPUT \u2014 pick ONE:\nA) `LOGGED` \u2014 suppressed, never delivered\nB) `NEEDS ATTENTION: W{n}: <one line>` \u2014 always delivered\nC) Fleet Report text \u2014 delivered on report cycles\n\n## PRIORITY ORDER (when multiple signals detected)\nGOAL_ACTIONS > ESCALATION > WRAPUP > IDLE_NUDGE > FLEET REPORT > SILENT\n\n## REVIEW GATE ENFORCEMENT (AFTER /WRITING-PLANS OR PLAN ACKNOWLEDGEMENT)\nWhen the review gate fails, send specific guidance:\n- Parse the spec/plan properly\n- Provide specific review feedback (not generic)\n- Ensure dependencies are listed\n- Ensure edge cases are covered\n- Ensure methodology is justified\n- Ensure deliverables are defined\n- Only then approve with `proceed`\n\n## BRAINSTORMING ENFORCEMENT (AFTER /ORIENT)\nWhen a window has just run `/orient` (captured pane shows \"agent ready\" or \"waiting for task\" after /orient):\n1. Send `/brainstorming` FIRST: `~/.hermes/scripts/tmux-act.sh submit_text W=N TEXT=\"/brainstorming\"`\n2. Wait for brainstorming mode (next cycle)\n3. THEN send your actual task/direction\n\nNEVER send directives directly to a window that just ran /orient.",
+      "skills": [
+        "obsidian"
+      ],
+      "skill": "obsidian",
+      "model": "qwen-local",
+      "provider": "custom",
+      "base_url": "http://localhost:8000/v1",
+      "script": "fleet-supervisor-auto-resolver.py",
+      "no_agent": false,
+      "context_from": null,
+      "schedule": {
+        "kind": "cron",
+        "expr": "*/5 * * * *",
+        "display": "*/5 * * * *"
+      },
+      "schedule_display": "*/5 * * * *",
+      "repeat": {
+        "times": null,
+        "completed": 4893
+      },
+      "enabled": true,
+      "state": "scheduled",
+      "paused_at": null,
+      "paused_reason": null,
+      "created_at": "2026-06-03T11:56:08.356112-04:00",
+      "next_run_at": "2026-06-24T08:35:00-04:00",
+      "last_run_at": "2026-06-24T08:30:48.803155-04:00",
+      "last_status": "ok",
+      "last_error": null,
+      "last_delivery_error": null,
+      "deliver": "origin",
+      "origin": {
+        "platform": "telegram",
+        "chat_id": "8694703431",
+        "chat_name": "Alexander Chang",
+        "thread_id": null
+      },
+      "enabled_toolsets": [
+        "terminal"
+      ],
+      "workdir": null,
+      "profile": null,
+      "extra_body": {
+        "enable_thinking": false
+      }
+    },
+    {
+      "id": "d47cbbbf9453",
+      "name": "Cron Pipeline Monitor",
+      "prompt": "Cron health monitor \u2014 delivers failures only.",
+      "skills": [],
+      "skill": null,
+      "model": null,
+      "provider": null,
+      "base_url": null,
+      "script": "cron-monitor.sh",
+      "no_agent": true,
+      "context_from": null,
+      "schedule": {
+        "kind": "interval",
+        "minutes": 30,
+        "display": "every 30m"
+      },
+      "schedule_display": "every 30m",
+      "repeat": {
+        "times": null,
+        "completed": 775
+      },
+      "enabled": true,
+      "state": "scheduled",
+      "paused_at": null,
+      "paused_reason": null,
+      "created_at": "2026-06-05T22:04:23.862223-04:00",
+      "next_run_at": "2026-06-24T08:35:38.618103-04:00",
+      "last_run_at": "2026-06-24T08:05:38.618103-04:00",
+      "last_status": "ok",
+      "last_error": null,
+      "last_delivery_error": null,
+      "deliver": "local",
+      "enabled_toolsets": null,
+      "workdir": null,
+      "profile": null
+    },
+    {
+      "id": "9a3764aced49",
+      "name": "Gateway Self-Heal",
+      "prompt": "Detects broken Telegram connectivity and triggers gateway restart via tmux.",
+      "skills": [],
+      "skill": null,
+      "model": "qwen-local",
+      "provider": "custom",
+      "base_url": null,
+      "script": "gateway-self-heal.sh",
+      "no_agent": true,
+      "context_from": null,
+      "schedule": {
+        "kind": "interval",
+        "minutes": 10,
+        "display": "every 10m"
+      },
+      "schedule_display": "every 10m",
+      "repeat": {
+        "times": null,
+        "completed": 1309
+      },
+      "enabled": true,
+      "state": "scheduled",
+      "paused_at": null,
+      "paused_reason": null,
+      "created_at": "2026-06-12T10:17:42.010408-04:00",
+      "next_run_at": "2026-06-24T08:37:39.043556-04:00",
+      "last_run_at": "2026-06-24T08:27:39.043556-04:00",
+      "last_status": "ok",
+      "last_error": null,
+      "last_delivery_error": null,
+      "deliver": "origin",
+      "origin": {
+        "platform": "telegram",
+        "chat_id": "8694703431",
+        "chat_name": "Alexander Chang",
+        "thread_id": null
+      },
+      "enabled_toolsets": [
+        "terminal",
+        "file"
+      ],
+      "workdir": null,
+      "profile": null
+    }
+  ],
+  "updated_at": "2026-06-24T08:30:48.806215-04:00"
+}
