@@ -1214,8 +1214,14 @@ class GatewayStreamConsumer:
         prefix as a new message, and best-effort strips the stuck cursor
         from the previous partial message.
         """
-        if not self._fallback_final_send:
-            await self._try_strip_cursor()
+        # When _fallback_final_send is already set, editing has permanently
+        # failed and _send_fallback_final will deliver the complete answer on
+        # got_done.  Tail-flushing here would send an intermediate email
+        # (or other uneditable message) for every tool boundary, spamming
+        # the user with partial thoughts before the final answer arrives.
+        if self._fallback_final_send:
+            return
+        await self._try_strip_cursor()
         visible = self._fallback_prefix or self._visible_prefix()
         tail = self._accumulated
         if visible and tail.startswith(visible):

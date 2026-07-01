@@ -18,6 +18,7 @@ Environment variables:
 import asyncio
 import email as email_lib
 import imaplib
+import json
 import logging
 import os
 import re
@@ -476,6 +477,62 @@ class EmailAdapter(BasePlatformAdapter):
             extra.get("authserv_id", "") or os.getenv("EMAIL_AUTHSERV_ID", "")
         ).strip().lower()
 
+        # Persistent store of successfully dispatched message UIDs.
+        # On restart, only messages whose UIDs are in this store are skipped —
+        # everything else (including messages marked SEEN by a failed dispatch)
+        # will be re-fetched and re-processed.
+        cache_dir = os.path.expanduser("~/.hermes/cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        self._completed_uids_path = os.path.join(cache_dir, "email-completed-uids.json")
+
+        # ── Email-triggered workflows ───────────────────────────────────────
+        # Each workflow defines a subject_prefix, allowed_senders, and a
+        # structured prompt that tells the agent what skill pipeline to run.
+        # When an incoming email subject matches a workflow prefix AND the
+        # sender is allow-listed, the raw email body is replaced with the
+        # workflow prompt (plus attachment context) so the agent session
+        # starts with the right instructions instead of a free-form chat.
+        #
+        # Config schema (under platforms.email.extra.workflows):
+        #   citation-review:
+        #     subject_prefix: "citation-review"
+        #     description: "Verify citations in an attached manuscript"
+        #     allowed_senders:
+        #       - user@example.com
+        #     skill: citation-review   # skill name to load via /skill-name
+        #     prompt: |                # optional override; default auto-generated
+        #
+        # Allowed-sender is checked here AND at the EMAIL_ALLOWED_USERS gate
+        # above — workflow senders MUST also be in EMAIL_ALLOWED_USERS.
+        raw_workflows = extra.get("workflows", {}) or {}
+        self._workflows: Dict[str, Dict[str, Any]] = {}
+        for wf_id, wf_cfg in raw_workflows.items():
+            if not isinstance(wf_cfg, dict):
+                continue
+            prefix = (wf_cfg.get("subject_prefix") or wf_id).strip().lower()
+            allowed = {
+                a.strip().lower()
+                for a in wf_cfg.get("allowed_senders", [])
+                if isinstance(a, str) and a.strip()
+            }
+            if not allowed:
+                continue
+            self._workflows[prefix] = {
+                "id": wf_id,
+                "subject_prefix": prefix,
+                "allowed_senders": allowed,
+                "skill": wf_cfg.get("skill", wf_id),
+                "description": wf_cfg.get("description", ""),
+                "prompt": wf_cfg.get("prompt", ""),
+                "reply_subject": wf_cfg.get("reply_subject", ""),
+            }
+        if self._workflows:
+            wf_names = ", ".join(
+                f"{v['subject_prefix']} ({len(v['allowed_senders'])} senders)"
+                for v in self._workflows.values()
+            )
+            logger.info("[Email] Loaded %d workflows: %s", len(self._workflows), wf_names)
+
         # Track message IDs we've already processed to avoid duplicates
         self._seen_uids: set = set()
         self._seen_uids_max: int = 2000   # cap to prevent unbounded memory growth
@@ -483,6 +540,26 @@ class EmailAdapter(BasePlatformAdapter):
 
         # Map chat_id (sender email) -> last subject + message-id for threading
         self._thread_context: Dict[str, Dict[str, str]] = {}
+
+        # ── Batched-send state ──────────────────────────────────────────────
+        # Email cannot edit messages — each intermediate segment would create
+        # a separate email.  Instead, buffer all segment content and send the
+        # accumulated response as one email after a debounce period.  A short
+        # ack is sent immediately so the user knows the request was received.
+        self._send_buffer: list[str] = []
+        self._ack_sent = False
+        self._first_reply_to: Optional[str] = None
+        self._chat_id_for_flush: Optional[str] = None
+        self._flush_delay: float = 30.0          # seconds of quiet before flush
+        self._flush_timer: Optional[asyncio.TimerHandle] = None
+        # Attachments to include in the aggregated flush email.
+        # Each entry: (file_path, file_name|None)
+        self._pending_attachments: list[tuple[str, Optional[str]]] = []
+        # UID of the message currently being processed.  Saved on dispatch and
+        # only promoted to "completed" after the final response email is sent
+        # (inside _flush_send_buffer).  If the session fails before sending,
+        # this UID stays uncompleted and the restart catch-up re-dispatches it.
+        self._pending_msg_uid: Optional[bytes] = None
 
         logger.info("[Email] Adapter initialized for %s", self._address)
 
@@ -505,6 +582,28 @@ class EmailAdapter(BasePlatformAdapter):
         except (ValueError, TypeError):
             # Fallback: just clear old entries if sort fails
             self._seen_uids = set(list(self._seen_uids)[-self._seen_uids_max // 2:])
+
+    def _load_completed_uids(self) -> set:
+        """Load the set of fully-dispatch-completed message UIDs from disk."""
+        try:
+            with open(self._completed_uids_path) as f:
+                return set(json.load(f))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return set()
+
+    def _append_completed_uid(self, uid: bytes) -> None:
+        """Record a message UID as fully dispatched (not just fetched)."""
+        uid_str = uid.decode() if isinstance(uid, bytes) else str(uid)
+        completed = self._load_completed_uids()
+        completed.add(uid_str)
+        # Keep the last 5000 to bound file size
+        sorted_uids = sorted(completed, key=int)[-5000:]
+        try:
+            os.makedirs(os.path.dirname(self._completed_uids_path), exist_ok=True)
+            with open(self._completed_uids_path, "w") as f:
+                json.dump(sorted_uids, f)
+        except Exception as e:
+            logger.warning("[Email] Failed to persist completed UID: %s", e)
 
     def _connect_smtp(self) -> smtplib.SMTP:
         """Create an SMTP connection, selecting the correct protocol for the port.
@@ -548,53 +647,36 @@ class EmailAdapter(BasePlatformAdapter):
             # Retry with IPv4 only.
             return _connect(ipv4_only=True)
 
-    async def connect(self, *, is_reconnect: bool = False) -> bool:
-        """Connect to the IMAP server and start polling for new messages."""
-        # Validate up front so a missing host surfaces as an actionable config
-        # error instead of IMAP4_SSL("") raising the cryptic
-        # ``[Errno 8] nodename nor servname provided, or not known``.
-        missing = [
-            name
-            for name, value in (
-                ("EMAIL_ADDRESS", self._address),
-                ("EMAIL_PASSWORD", self._password),
-                ("EMAIL_IMAP_HOST", self._imap_host),
-                ("EMAIL_SMTP_HOST", self._smtp_host),
-            )
-            if not value
-        ]
-        if missing:
-            message = (
-                "Not configured — missing "
-                + ", ".join(missing)
-                + ". Set it via `hermes gateway setup` (env) or platforms.email "
-                "in config.yaml."
-            )
-            logger.error("[Email] %s", message)
-            # Mark non-retryable so the gateway does NOT keep reconnecting against
-            # an empty host. A blank-but-present env var (e.g. ``EMAIL_IMAP_HOST=``)
-            # used to slip past the startup gate and drive an indefinite retry
-            # loop that leaked memory until the host OOM-killed (#40715).
-            self._set_fatal_error(
-                "email_missing_configuration", message, retryable=False
-            )
-            return False
+    async def connect(self) -> bool:
+        """Connect to the IMAP server, seed seen-UIDs from completed store,
+        and catch-up any messages that were never completed (e.g. from a
+        previous gateway crash or downtime)."""
+        # ── 1. Load completed UIDs from persistent store ──
+        completed_uids = self._load_completed_uids()
+        logger.info("[Email] Loaded %d completed message UIDs", len(completed_uids))
+        self._seen_uids = {u.encode() if isinstance(u, str) else u for u in completed_uids}
+        self._trim_seen_uids()
 
         try:
-            # Test IMAP connection
+            # ── 2. Test IMAP connection + discover uncompleted messages ──
             imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
             imap.login(self._address, self._password)
             _send_imap_id(imap)
-            # Mark all existing messages as seen so we only process new ones
             imap.select("INBOX")
+
             status, data = imap.uid("search", None, "ALL")
+            catchup_uids: list = []
             if status == "OK" and data and data[0]:
                 for uid in data[0].split():
-                    self._seen_uids.add(uid)
-            # Keep only the most recent UIDs to prevent unbounded growth
-            self._trim_seen_uids()
+                    if uid not in self._seen_uids:
+                        catchup_uids.append(uid)
             imap.logout()
-            logger.info("[Email] IMAP connection test passed. %d existing messages skipped.", len(self._seen_uids))
+
+            logger.info(
+                "[Email] IMAP connection test passed. %d completed skipped, "
+                "%d uncompleted messages for catch-up.",
+                len(self._seen_uids), len(catchup_uids),
+            )
         except Exception as e:
             logger.error("[Email] IMAP connection failed: %s", e)
             return False
@@ -613,6 +695,18 @@ class EmailAdapter(BasePlatformAdapter):
 
         self._running = True
         self._poll_task = asyncio.create_task(self._poll_loop())
+
+        # ── 3. Catch-up: dispatch any messages found on the server that
+        #    were never marked completed (arrived during downtime, or a
+        #    previous dispatch failed mid-way).
+        if catchup_uids:
+            loop = asyncio.get_running_loop()
+            catchup_msgs = await loop.run_in_executor(
+                None, self._fetch_by_uids, catchup_uids
+            )
+            for msg_data in catchup_msgs:
+                await self._dispatch_message(msg_data)
+
         print(f"[Email] Connected as {self._address}")
         return True
 
@@ -770,11 +864,8 @@ class EmailAdapter(BasePlatformAdapter):
             logger.debug("[Email] Dropping automated sender at dispatch: %s", sender_addr)
             return
 
-        # Skip senders not in EMAIL_ALLOWED_USERS — prevents the adapter
-        # from creating a MessageEvent (and thus thread context) for senders
-        # that the gateway will never authorize.  Without this early guard,
-        # a race between dispatch and authorization can result in the adapter
-        # sending a reply even though the handler returned None.
+        # Gate 1: Reject senders not in EMAIL_ALLOWED_USERS with an
+        # automatic reply so they know they reached a managed agent.
         allowed_raw = os.getenv("EMAIL_ALLOWED_USERS", "").strip()
         if not allowed_raw:
             if os.getenv("EMAIL_ALLOW_ALL_USERS", "").strip().lower() not in {"true", "1", "yes"} and (
@@ -789,7 +880,15 @@ class EmailAdapter(BasePlatformAdapter):
         else:
             allowed = {addr.strip().lower() for addr in allowed_raw.split(",") if addr.strip()}
             if sender_addr.lower() not in allowed:
-                logger.debug("[Email] Dropping non-allowlisted sender at dispatch: %s", sender_addr)
+                logger.debug("[Email] Rejecting non-allowlisted sender: %s", sender_addr)
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None,
+                    self._send_email,
+                    sender_addr,
+                    "You are not authorized to access this agent.",
+                    msg_data.get("message_id"),
+                )
                 return
 
         # Reject spoofed senders. The allowlist (and the gateway's own authz)
@@ -821,11 +920,95 @@ class EmailAdapter(BasePlatformAdapter):
         subject = msg_data["subject"]
         body = msg_data["body"].strip()
         attachments = msg_data["attachments"]
+        sender_addr_lower = sender_addr.lower()
 
-        # Build message text: include subject as context
-        text = body
-        if subject and not subject.startswith("Re:"):
-            text = f"[Subject: {subject}]\n\n{body}"
+        # ── Workflow dispatch ──────────────────────────────────────────────
+        # If the subject matches a configured workflow prefix AND the sender
+        # is on that workflow's allow-list, replace the email body with a
+        # structured prompt so the agent session starts with the right
+        # pipeline instructions instead of a free-form chat.
+        workflow_text = None
+        workflow_reply_subject = None
+        subject_lower = subject.lower().strip()
+
+        # Sort prefixes by length descending so more specific prefixes
+        # (e.g. "citation-review add") match before shorter ones ("citation-review").
+        sorted_prefixes = sorted(self._workflows.keys(), key=len, reverse=True)
+        for prefix in sorted_prefixes:
+            wf = self._workflows[prefix]
+            if subject_lower.startswith(prefix) and sender_addr_lower in wf["allowed_senders"]:
+                wf_id = wf["id"]
+                description = wf["description"] or f"Execute the {wf_id} workflow"
+                skill_name = wf["skill"]
+
+                # Build the workflow prompt, including original email subject and
+                # body so the agent can detect user intent (e.g. "add citations"
+                # vs "review citations").
+                att_names = ", ".join(a["filename"] for a in attachments) if attachments else "attached document"
+                body_snippet = body[:2000].strip() if body else "(empty)"
+                default_prompt = (
+                    f"You are running the /{wf_id} workflow sent by {sender_addr}.\n\n"
+                    f"Original subject: {subject}\n"
+                    f"Original body: {body_snippet}\n\n"
+                    f"{description}\n\n"
+                    f"1. Load the `/{skill_name}` skill and follow its instructions exactly.\n"
+                    f"2. Process the attached file(s): {att_names}\n"
+                    f"3. When done, reply to this email with the result.\n"
+                    f"   - If producing a revised file, include MEDIA:/path/to/output in your response.\n"
+                    f"   - Include a brief summary of what was done in the email body.\n"
+                    f"\n"
+                    f"CRITICAL: Your response on each turn IS SENT as an email reply. Do NOT write\n"
+                    f"chain-of-thought, reasoning, or intermediate status in your response. Only respond\n"
+                    f"when you have a complete deliverable (the annotated file with attachments).\n"
+                    f"Work silently throughout the pipeline — your first response should be the final result."
+                )
+                workflow_text = wf["prompt"] or default_prompt
+                workflow_reply_subject = wf.get("reply_subject") or f"Re: {subject}"
+                logger.info(
+                    "[Email] Workflow match: '%s' from %s → %s",
+                    wf_id, sender_addr, skill_name,
+                )
+                break
+
+        if workflow_text:
+            # Workflow matched — use structured prompt, not raw email body
+            text = workflow_text
+        else:
+            # Gate 2: No workflow matched — reject with list of approved workflows.
+            # This applies to both unrecognised subjects and senders whose
+            # email is not on the matching workflow's allowed_senders list.
+            if not self._workflows:
+                text = body
+                if subject and not subject.startswith("Re:"):
+                    text = f"[Subject: {subject}]\n\n{body}"
+            else:
+                wf_list = "\n".join(
+                    f"- {w['subject_prefix']}: {w['description']}"
+                    for w in self._workflows.values()
+                )
+                rejection = (
+                    f"I can't do that. Here are the approved workflows:\n\n"
+                    f"{wf_list}\n\n"
+                    f"To use a workflow, send an email with a subject line that "
+                    f"starts with the workflow prefix shown above."
+                )
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None,
+                    self._send_email,
+                    sender_addr,
+                    rejection,
+                    msg_data.get("message_id"),
+                )
+                self._append_completed_uid(msg_data["uid"])
+                return
+
+        # Override thread subject for workflow replies
+        if workflow_reply_subject:
+            self._thread_context[sender_addr] = {
+                "subject": workflow_reply_subject,
+                "message_id": msg_data["message_id"],
+            }
 
         # Determine message type and media
         media_urls = []
@@ -871,6 +1054,66 @@ class EmailAdapter(BasePlatformAdapter):
 
         logger.info("[Email] New message from %s: %s", sender_addr, subject)
         await self.handle_message(event)
+        # Don't mark as completed yet — the agent needs to finish processing
+        # and send the response.  Completion is recorded in
+        # _flush_send_buffer after the aggregated response email goes out.
+        # This lets failed/crashed sessions be re-dispatched on restart.
+        self._pending_msg_uid = msg_data["uid"]
+
+
+    def _cancel_flush_timer(self) -> None:
+        if self._flush_timer is not None:
+            self._flush_timer.cancel()
+            self._flush_timer = None
+
+    def _restart_flush_timer(self) -> None:
+        self._cancel_flush_timer()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._flush_timer = loop.call_later(
+            self._flush_delay,
+            self._on_flush_timer_expired,
+        )
+
+    def _on_flush_timer_expired(self) -> None:
+        """Called when the debounce timer fires — flush the buffer."""
+        self._flush_timer = None
+        asyncio.ensure_future(self._flush_send_buffer())
+
+    async def _flush_send_buffer(self) -> None:
+        """Send buffered content + attachments as one email, then clear."""
+        if not self._send_buffer and not self._pending_attachments:
+            return
+        to_addr = self._chat_id_for_flush
+        if not to_addr:
+            self._send_buffer.clear()
+            self._pending_attachments.clear()
+            return
+        full_body = "\n\n".join(self._send_buffer)
+        self._send_buffer.clear()
+        try:
+            loop = asyncio.get_running_loop()
+            if self._pending_attachments:
+                file_paths = [p for p, _ in self._pending_attachments]
+                await loop.run_in_executor(
+                    None,
+                    self._send_email_with_attachments_flush,
+                    to_addr, full_body, file_paths, self._first_reply_to,
+                )
+                self._pending_attachments.clear()
+            else:
+                await loop.run_in_executor(
+                    None, self._send_email, to_addr, full_body, self._first_reply_to,
+                )
+            # Agent finished and response sent — mark the source message as
+            # completed so restart catch-up doesn't re-dispatch it.
+            if self._pending_msg_uid is not None:
+                self._append_completed_uid(self._pending_msg_uid)
+                self._pending_msg_uid = None
+        except Exception as e:
+            logger.error("[Email] Flush send failed to %s: %s", to_addr, e)
 
     async def send(
         self,
@@ -879,13 +1122,42 @@ class EmailAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send an email reply to the given address."""
+        """Buffer segment text and deliver in batch.  Only the ack is sent
+        immediately; the full response is emailed once the agent finishes."""
         try:
             loop = asyncio.get_running_loop()
-            message_id = await loop.run_in_executor(
-                None, self._send_email, chat_id, content, reply_to
-            )
-            return SendResult(success=True, message_id=message_id)
+
+            # Always buffer the content for the final aggregated flush.
+            self._send_buffer.append(content)
+
+            if reply_to is not None and not self._ack_sent:
+                # First segment: send a short acknowledgment immediately so
+                # the user knows the request was received, then buffer the
+                # rest for the aggregated final email.
+                self._ack_sent = True
+                self._first_reply_to = reply_to
+                self._chat_id_for_flush = chat_id
+                ack_text = (
+                    "Acknowledged. Once the work is complete, "
+                    "the full response will be delivered in a follow-up email."
+                )
+                ack_id = await loop.run_in_executor(
+                    None, self._send_email, chat_id, ack_text, reply_to,
+                )
+                self._restart_flush_timer()
+                return SendResult(success=True, message_id=ack_id)
+
+            if reply_to is not None:
+                # Intermediate segment: buffer already appended.  Restart the
+                # debounce timer so the aggregated send waits for quiet.
+                self._restart_flush_timer()
+                return SendResult(success=True, message_id=f"buf-{id(self)}")
+
+            # reply_to is None — from _send_fallback_final or (gated) tail-
+            # flush.  The debounce timer will handle the aggregated flush;
+            # no need to send separately here.
+            return SendResult(success=True, message_id="batched")
+
         except Exception as e:
             logger.error("[Email] Send failed to %s: %s", chat_id, e)
             return SendResult(success=False, error=str(e))
@@ -1059,6 +1331,68 @@ class EmailAdapter(BasePlatformAdapter):
         logger.info("[Email] Sent multi-attachment email to %s (%d files)", to_addr, len(file_paths))
         return msg_id
 
+    def _send_email_with_attachments_flush(
+        self,
+        to_addr: str,
+        body: str,
+        file_paths: List[str],
+        reply_to_msg_id: Optional[str] = None,
+    ) -> str:
+        """Send aggregated text + multiple attachments in one email (flush path).
+
+        Like ``_send_email_with_attachments`` but accepts an explicit
+        ``reply_to_msg_id`` for In-Reply-To threading against the ack email.
+        """
+        msg = MIMEMultipart()
+        msg["From"] = self._address
+        msg["To"] = to_addr
+
+        ctx = self._thread_context.get(to_addr, {})
+        subject = ctx.get("subject", "Hermes Agent")
+        if not subject.startswith("Re:"):
+            subject = f"Re: {subject}"
+        msg["Subject"] = subject
+
+        # Use provided reply_to_msg_id for threading against the ack,
+        # falling back to the thread context.
+        original_msg_id = reply_to_msg_id or ctx.get("message_id")
+        if original_msg_id:
+            msg["In-Reply-To"] = original_msg_id
+            msg["References"] = original_msg_id
+
+        msg["Date"] = formatdate(localtime=True)
+        msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._address.split('@')[1]}>"
+        msg["Message-ID"] = msg_id
+
+        if body:
+            msg.attach(MIMEText(body, "plain", "utf-8"))
+
+        for file_path in file_paths:
+            p = Path(file_path)
+            try:
+                with open(p, "rb") as f:
+                    part = MIMEBase("application", "octet-stream")
+                    part.set_payload(f.read())
+                    encoders.encode_base64(part)
+                    part.add_header("Content-Disposition", f"attachment; filename={p.name}")
+                    msg.attach(part)
+            except Exception as e:
+                logger.warning("[Email] Failed to attach %s: %s", file_path, e)
+
+        smtp = smtplib.SMTP(self._smtp_host, self._smtp_port, timeout=30)
+        try:
+            smtp.starttls(context=ssl.create_default_context())
+            smtp.login(self._address, self._password)
+            smtp.send_message(msg)
+        finally:
+            try:
+                smtp.quit()
+            except Exception:
+                smtp.close()
+
+        logger.info("[Email] Sent flush email to %s (%d attachments)", to_addr, len(file_paths))
+        return msg_id
+
     async def send_document(
         self,
         chat_id: str,
@@ -1068,7 +1402,24 @@ class EmailAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         **kwargs,
     ) -> SendResult:
-        """Send a file as an email attachment."""
+        """Send a file as an email attachment.
+
+        When the batched-send buffer is active (ack already sent), the
+        attachment is queued for the aggregated flush email instead of
+        being sent immediately as a separate message.
+        """
+        # If we're in buffered mode, queue this attachment for the flush.
+        if self._ack_sent:
+            self._pending_attachments.append((file_path, file_name))
+            if caption:
+                # Also buffer caption text so it appears in the final body.
+                self._send_buffer.append(caption)
+            logger.debug(
+                "[Email] Queued attachment %s for flush buffer (%d pending)",
+                file_path, len(self._pending_attachments),
+            )
+            return SendResult(success=True, message_id=f"att-{id(self)}")
+        # No buffered send in progress — send immediately as a standalone email.
         try:
             loop = asyncio.get_running_loop()
             message_id = await loop.run_in_executor(

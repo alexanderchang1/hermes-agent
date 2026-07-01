@@ -500,8 +500,8 @@ class TestDispatchMessage(unittest.TestCase):
         self.assertEqual(event.source.user_name, "John Doe")
         self.assertEqual(event.source.chat_type, "dm")
 
-    def test_non_allowlisted_sender_dropped(self):
-        """Senders not in EMAIL_ALLOWED_USERS should be dropped before dispatch."""
+    def test_non_allowlisted_sender_rejected(self):
+        """Senders not in EMAIL_ALLOWED_USERS get an authorization reply."""
         import asyncio
         with patch.dict(os.environ, {
             "EMAIL_ALLOWED_USERS": "hermes@test.com,admin@test.com",
@@ -521,11 +521,22 @@ class TestDispatchMessage(unittest.TestCase):
                 "date": "",
             }
 
-            asyncio.run(adapter._dispatch_message(msg_data))
+            with patch("smtplib.SMTP") as mock_smtp:
+                mock_server = MagicMock()
+                mock_smtp.return_value = mock_server
+
+                asyncio.run(adapter._dispatch_message(msg_data))
+
             # Handler should NOT be called for non-allowlisted sender
             adapter._message_handler.assert_not_called()
             # Thread context should NOT be created
             self.assertNotIn("outsider@evil.com", adapter._thread_context)
+            # An authorization rejection email should have been sent
+            mock_server.send_message.assert_called_once()
+            sent_msg = mock_server.send_message.call_args[0][0]
+            # Body is base64-encoded in a multipart MIME message; check the decoded text
+            body_text = sent_msg.get_payload(0).get_payload(decode=True).decode("utf-8")
+            self.assertIn("not authorized", body_text)
 
     def test_allowlisted_sender_proceeds(self):
         """Senders in EMAIL_ALLOWED_USERS should proceed to dispatch normally."""
@@ -745,6 +756,124 @@ class TestDispatchMessage(unittest.TestCase):
 
             asyncio.run(adapter._dispatch_message(msg_data))
             self.assertEqual(len(captured), 1)
+
+    def test_unrecognised_subject_rejected_with_workflows(self):
+        """When no workflow matches and workflows are configured, reply
+        with the list of approved workflows instead of dispatching."""
+        import asyncio
+        from gateway.config import PlatformConfig, Platform
+        from plugins.platforms.email.adapter import EmailAdapter
+
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_IMAP_PORT": "993",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+            "EMAIL_SMTP_PORT": "587",
+        }):
+            config = PlatformConfig(enabled=True, extra={
+                "workflows": {
+                    "citation-review": {
+                        "subject_prefix": "citation-review",
+                        "description": "Verify citations in a manuscript",
+                        "allowed_senders": ["authorized@test.com"],
+                        "skill": "citation-review",
+                    },
+                    "data-pull": {
+                        "subject_prefix": "data-pull",
+                        "description": "Pull data from the database",
+                        "allowed_senders": ["authorized@test.com"],
+                        "skill": "data-pull",
+                    },
+                },
+            })
+            adapter = EmailAdapter(config)
+            adapter.handle_message = AsyncMock()
+
+            msg_data = {
+                "uid": b"200",
+                "sender_addr": "authorized@test.com",
+                "sender_name": "Auth User",
+                "subject": "Do something random",
+                "message_id": "<random@test.com>",
+                "in_reply_to": "",
+                "body": "Please run a random task",
+                "attachments": [],
+                "date": "",
+            }
+
+            with patch("smtplib.SMTP") as mock_smtp:
+                mock_server = MagicMock()
+                mock_smtp.return_value = mock_server
+
+                asyncio.run(adapter._dispatch_message(msg_data))
+
+            # Handler should NOT be called — the email was rejected
+            adapter.handle_message.assert_not_awaited()
+            # A rejection email should have been sent with the workflow list
+            mock_server.send_message.assert_called_once()
+            sent_msg = mock_server.send_message.call_args[0][0]
+            body_text = sent_msg.get_payload(0).get_payload(decode=True).decode("utf-8")
+            self.assertIn("I can't do that", body_text)
+            self.assertIn("citation-review", body_text)
+            self.assertIn("data-pull", body_text)
+            self.assertNotIn("Do something random", body_text)
+
+    def test_unrecognised_subject_rejected_when_sender_not_in_workflow_allowlist(self):
+        """When subject matches a workflow prefix but the sender is not on
+        that workflow's allowed_senders, reject with the full workflow list."""
+        import asyncio
+        from gateway.config import PlatformConfig, Platform
+        from plugins.platforms.email.adapter import EmailAdapter
+
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_IMAP_PORT": "993",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+            "EMAIL_SMTP_PORT": "587",
+        }):
+            config = PlatformConfig(enabled=True, extra={
+                "workflows": {
+                    "citation-review": {
+                        "subject_prefix": "citation-review",
+                        "description": "Verify citations in a manuscript",
+                        "allowed_senders": ["doctor@test.com"],
+                        "skill": "citation-review",
+                    },
+                },
+            })
+            adapter = EmailAdapter(config)
+            adapter.handle_message = AsyncMock()
+
+            msg_data = {
+                "uid": b"201",
+                "sender_addr": "nurse@test.com",
+                "sender_name": "Nurse",
+                "subject": "citation-review please check this paper",
+                "message_id": "<cite@test.com>",
+                "in_reply_to": "",
+                "body": "Please check citations",
+                "attachments": [],
+                "date": "",
+            }
+
+            with patch("smtplib.SMTP") as mock_smtp:
+                mock_server = MagicMock()
+                mock_smtp.return_value = mock_server
+
+                asyncio.run(adapter._dispatch_message(msg_data))
+
+            # Handler should NOT be called
+            adapter.handle_message.assert_not_awaited()
+            # Rejection sent with workflow list
+            mock_server.send_message.assert_called_once()
+            sent_msg = mock_server.send_message.call_args[0][0]
+            body_text = sent_msg.get_payload(0).get_payload(decode=True).decode("utf-8")
+            self.assertIn("I can't do that", body_text)
+            self.assertIn("citation-review", body_text)
 
 
 class TestThreadContext(unittest.TestCase):
