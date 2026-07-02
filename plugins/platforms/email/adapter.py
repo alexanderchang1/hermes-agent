@@ -647,7 +647,7 @@ class EmailAdapter(BasePlatformAdapter):
             # Retry with IPv4 only.
             return _connect(ipv4_only=True)
 
-    async def connect(self) -> bool:
+    async def connect(self, is_reconnect: bool = False) -> bool:
         """Connect to the IMAP server, seed seen-UIDs from completed store,
         and catch-up any messages that were never completed (e.g. from a
         previous gateway crash or downtime)."""
