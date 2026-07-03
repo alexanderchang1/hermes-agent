@@ -459,6 +459,7 @@ class HermesACPAgent(acp.Agent):
         "compact": "Compress conversation context",
         "steer": "Inject guidance into the currently running agent turn",
         "queue": "Queue a prompt to run after the current turn finishes",
+        "delegate": "Delegate a task to a subagent (like Claude Code /delegate)",
         "version": "Show Hermes version",
     }
 
@@ -1743,6 +1744,7 @@ class HermesACPAgent(acp.Agent):
             "compact": self._cmd_compact,
             "steer": self._cmd_steer,
             "queue": self._cmd_queue,
+            "delegate": self._cmd_delegate,
             "version": self._cmd_version,
         }.get(cmd)
 
@@ -1750,7 +1752,10 @@ class HermesACPAgent(acp.Agent):
             return None  # not a known command — let the LLM handle it
 
         try:
-            return handler(args, state)
+            result = handler(args, state)
+            if result is None:
+                return None  # handler opted to let the agent handle it (e.g. /delegate, /steer)
+            return result
         except Exception as e:
             logger.error("Slash command /%s error: %s", cmd, e, exc_info=True)
             return f"Error executing /{cmd}: {e}"
@@ -1986,6 +1991,14 @@ class HermesACPAgent(acp.Agent):
             state.queued_prompts.append(queued_text)
             depth = len(state.queued_prompts)
         return f"Queued for the next turn. ({depth} queued)"
+
+    def _cmd_delegate(self, args: str, state: SessionState) -> str:
+        """Handle /delegate — pass through to the agent as a normal turn."""
+        delegate_text = args.strip()
+        if not delegate_text:
+            return "Usage: /delegate <task description>\nDelegates the task to a subagent (Codex by default)."
+        # Return None to signal "let the agent handle this as a normal message"
+        return None
 
     def _cmd_version(self, args: str, state: SessionState) -> str:
         return f"Hermes Agent v{HERMES_VERSION}"

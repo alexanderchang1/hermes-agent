@@ -8491,6 +8491,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self.save_conversation()
         elif canonical == "cron":
             self._handle_cron_command(cmd_original)
+        elif canonical == "delegate":
+            # Strip /delegate prefix and send the rest to the agent,
+            # which already has delegate_task as an available tool.
+            # Like Claude Code's /delegate, this spawns a subagent
+            # with the given prompt.
+            _rest = cmd_original.split(maxsplit=1)
+            _delegate_text = (_rest[1] if len(_rest) > 1 else "").strip()
+            if not _delegate_text:
+                _cprint("  Usage: /delegate <task description>")
+                _cprint("  Delegates to Codex by default. The agent will use delegate_task to handle it.")
+            elif hasattr(self, '_pending_input'):
+                self._pending_input.put(cmd_original)
+            else:
+                _cprint("  No agent available to delegate to. Start a session first.")
         elif canonical == "suggestions":
             self._handle_suggestions_command(cmd_original)
         elif canonical == "blueprint":

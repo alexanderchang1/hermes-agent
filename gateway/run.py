@@ -9196,6 +9196,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _cmd_def_inner and _cmd_def_inner.name == "background":
                 return await self._handle_background_command(event)
 
+            # /delegate must bypass the running-agent guard — delegating a
+            # task to a subagent is inherently parallel and must not interrupt
+            # the active conversation. The handler rewrites the event text to
+            # let the agent route through delegate_task.
+            if _cmd_def_inner and _cmd_def_inner.name == "delegate":
+                _result = await self._handle_delegate_command(event)
+                if _result is not None:
+                    return _result
+                # Fall through — text was rewritten for the agent
             # /kanban must bypass the guard. It writes to a profile-agnostic
             # DB (kanban.db), not to the running agent's state. In fact
             # /kanban unblock is often the only way to free a worker that
@@ -9711,6 +9720,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "background":
             return await self._handle_background_command(event)
+
+        if canonical == "delegate":
+            _result = await self._handle_delegate_command(event)
+            if _result is not None:
+                return _result
+            # Fall through — text was rewritten for the agent
 
         if canonical == "steer":
             # No active agent — /steer has no tool call to inject into.

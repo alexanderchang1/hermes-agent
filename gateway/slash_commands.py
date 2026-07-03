@@ -2576,6 +2576,30 @@ class GatewaySlashCommandsMixin:
         preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
         return t("gateway.background.started", preview=preview, task_id=task_id)
 
+    async def _handle_delegate_command(self, event: MessageEvent) -> str:
+        """Handle /delegate <prompt> — delegate a task to a subagent.
+
+        Like Claude Code's /delegate: rewrites the event text so the agent
+        routes the prompt through delegate_task. Falls through to the agent
+        by returning None, same as /steer.
+        """
+        prompt = event.get_command_args().strip()
+        if not prompt:
+            return t("gateway.delegate.usage",
+                      default="Usage: /delegate <task description>\n"
+                              "Delegates the task to a subagent (Codex by default).")
+
+        # Rewrite the event text — the agent will see the full text and
+        # can use delegate_task to handle it. This preserves the user's
+        # exact wording so the agent knows what to delegate.
+        delegation_text = f"/delegate {prompt}"
+        try:
+            event.text = delegation_text
+        except Exception:
+            pass
+        # Return None to fall through to _handle_message_with_agent
+        return None
+
     async def _handle_reasoning_command(self, event: MessageEvent) -> str:
         """Handle /reasoning command — manage reasoning effort and display toggle.
 
