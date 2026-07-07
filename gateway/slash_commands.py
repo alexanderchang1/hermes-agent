@@ -929,6 +929,34 @@ class GatewaySlashCommandsMixin:
             return True
         return await self._resume_target_allowed(source, sid, allow_override=False)
 
+    async def _handle_status_report_command(self, event: MessageEvent) -> str:
+        """Handle /status-report command — fleet supervisor status after AFK."""
+        import subprocess
+
+        script = os.path.expanduser("~/.hermes/scripts/status-report.py")
+        if not os.path.exists(script):
+            return (
+                "Fleet status report script not found.\n"
+                f"Expected at: {script}"
+            )
+
+        try:
+            r = await asyncio.to_thread(
+                subprocess.run,
+                [sys.executable or "python3", script],
+                capture_output=True, text=True, timeout=90,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.strip()
+            error_detail = r.stderr.strip() if r.stderr.strip() else f"exit code {r.returncode}"
+            logger.warning("status-report script failed: %s", error_detail)
+            return f"Status report script failed: {error_detail}"
+        except subprocess.TimeoutExpired:
+            return "Status report timed out after 90s (collector may be slow)."
+        except Exception as exc:
+            logger.error("status-report handler error: %s", exc)
+            return f"Error generating status report: {exc}"
+
     async def _handle_agents_command(self, event: MessageEvent) -> str:
         """Handle /agents command - list active agents and running tasks."""
         from gateway.run import _AGENT_PENDING_SENTINEL

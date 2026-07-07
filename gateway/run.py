@@ -9534,6 +9534,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "status":
             return await self._handle_status_command(event)
 
+        if canonical == "status-report":
+            return await self._handle_status_report_command(event)
+
         if canonical == "agents":
             return await self._handle_agents_command(event)
 

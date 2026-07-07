@@ -248,6 +248,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True, args_hint="<path>"),
     CommandDef("update", "Update Hermes Agent to the latest version", "Info"),
     CommandDef("version", "Show Hermes Agent version", "Info", aliases=("v",)),
+    CommandDef("status-report", "Show fleet supervisor status report — windows, states, attention items", "Info",
+               aliases=("sr",), gateway_only=True),
     CommandDef("debug", "Upload debug report (system info + logs) and get shareable links", "Info",
                args_hint="[nous|local]"),
 
