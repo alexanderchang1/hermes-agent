@@ -19,6 +19,7 @@ The LLM agent reads this and takes minimal action:
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -65,7 +66,7 @@ NATURAL_END_THRESHOLD = 30  # Windows stuck in a task with pattern = "N tasks (a
 NATURAL_END_COOLDOWN = 3600  # Don't re-fire on the same window for 1 hour
 WRAPUP_TIMEOUT_MINUTES = 60
 IDLE_TIMEOUT_MINUTES = 45
-TERMINAL_STATES = {"goal_stopped"}
+TERMINAL_STATES = {"goal_stopped", "just_finished"}
 # Transient waiting states — agent is temporarily blocked. Eligible for idle nudge.
 NUDGEABLE_STATES = {"idle", "blocked_waiting", "blocked_survey", "needs_approval", "goal_suspicious", "empty"}
 WAITING_STATES = TERMINAL_STATES | NUDGEABLE_STATES
@@ -179,6 +180,29 @@ def _is_user_typing(pane_text):
     return False
 
 
+_PANE_SNIPPET_SKIP = re.compile(r'^(❯|\xa0|\s*\u2500|\s*$|⚕|context used|Input:|❯$)')
+
+def _pane_snippet(wid):
+    """Return last 3 meaningful lines from a window pane."""
+    text = _capture_pane_text(wid)
+    if not text:
+        return "[unreachable]"
+    lines = text.split('\n')
+    clean = []
+    for line in reversed(lines[-20:]):
+        stripped = line.strip()
+        if not stripped or _PANE_SNIPPET_SKIP.search(stripped):
+            continue
+        if len(stripped) <= 2:
+            continue
+        clean.append(stripped)
+        if len(clean) >= 3:
+            break
+    if not clean:
+        return "[bare prompt or empty]"
+    return ' | '.join(reversed(clean))
+
+
 def _check_window_idle_activity():
     """Detect user activity by actually reading panes, not relying on stale timestamps.
     
@@ -224,6 +248,8 @@ def track_idle(fleet: dict) -> tuple:
     cur_state = {}
     idle_warnings = []
     NON_WORKING = WAITING_STATES | {"monitoring", "subagent_menu"}
+    # States that, when a window transitions from them to idle, indicate "just finished"
+    PREV_WORKING_STATES = {"working", "monitoring", "subagent_menu", "goal_active"}
 
     for wid, info in fleet.items():
         if not isinstance(info, dict) or "state" not in info:
@@ -237,6 +263,17 @@ def track_idle(fleet: dict) -> tuple:
         prev_wid = prev_state.get(wid, {})
         prev_was_waiting = prev_wid.get("state") in WAITING_STATES
 
+        # Terminal states (goal_stopped, just_finished): skip entirely — never nudge
+        if state in TERMINAL_STATES:
+            continue
+
+        # Detect "just finished" transition: was working, now idle
+        just_finished = False
+        if is_waiting and not prev_was_waiting and state == "idle":
+            prev_state_name = prev_wid.get("state", "")
+            if prev_state_name in PREV_WORKING_STATES:
+                just_finished = True
+
         if is_waiting:
             # Window is in a waiting state
             if prev_was_waiting:
@@ -246,17 +283,21 @@ def track_idle(fleet: dict) -> tuple:
                 # JUST entered waiting — start timer now
                 start_epoch = now_epoch
 
-            cur_state[wid] = {"state": state, "since": start_epoch}
+            cur_state[wid] = {"state": state, "since": start_epoch, "just_finished": just_finished}
 
-            # TERMINAL states (goal_stopped): never nudge — wrap-up once via stale detection, then silent
+            # TERMINAL states already skipped above.
             # NUDGEABLE states: fire idle warning after timeout
             if state in NUDGEABLE_STATES:
                 elapsed_min = (now_epoch - start_epoch) / 60
-                if elapsed_min >= IDLE_TIMEOUT_MINUTES:
+                effective_timeout = IDLE_TIMEOUT_MINUTES * 2 if just_finished else IDLE_TIMEOUT_MINUTES
+                if elapsed_min >= effective_timeout:
                     idle_warnings.append(f"W{wid} ({wname}) [{state_label}] idle {elapsed_min:.0f}min")
         elif prev_was_waiting:
             # Window left a waiting state — keep tracking but update state.
-            cur_state[wid] = {"state": state, "since": prev_wid.get("since", now_epoch)}
+            cur_state[wid] = {"state": state, "since": prev_wid.get("since", now_epoch), "just_finished": False}
+        else:
+            # Non-waiting, non-terminal state — track for transition detection
+            cur_state[wid] = {"state": state, "since": now_epoch, "just_finished": False}
 
     _save_state(IDLE_STATE_FILE, cur_state)
     return idle_warnings, cur_state
@@ -682,6 +723,19 @@ def main():
     esc_summaries = data.get("escalation_summaries", [])
     warnings = data.get("warnings", [])
 
+    # Post-process fleet states: reclassify "idle" windows with completion signals as "just_finished"
+    for wid, info in fleet.items():
+        if isinstance(info, dict) and info.get("state") == "idle":
+            pane_text = _capture_pane_text(str(wid))
+            if pane_text and re.search(
+                r'(all done|all complete|task.*done|complete.*summary|✓.*\d+ of \d+|Wrote .* files|All tests.*passed|Validation.*complete|Done!|Finished!|Task complete)',
+                pane_text, re.I
+            ):
+                info["state"] = "just_finished"
+                details = info.get("details", [])
+                if isinstance(details, list):
+                    details.append("task just completed — idle but finished, not stuck")
+    
     # User activity
     recent_windows = _check_window_idle_activity()
 
@@ -862,7 +916,13 @@ def main():
         if idle_filtered:
             lines = [f"IDLE_NUDGE cycle={cycle}"]
             for w in idle_filtered[:5]:
+                try:
+                    wid = int(w.split(":")[0].split()[0].lstrip("W"))
+                except:
+                    wid = -1
+                snippet = _pane_snippet(str(wid)) if wid >= 0 else "[unknown]"
                 lines.append(f"  {w}")
+                lines.append(f"    pane: {snippet}")
             if recent_windows:
                 lines.append(f"  ⚠ USER ACTIVE ON W{sorted(recent_windows)}")
             print("\n".join(lines))

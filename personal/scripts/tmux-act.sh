@@ -9,6 +9,7 @@
 #   answer_proceed  W=<n>             — send "proceed" + Enter
 #   approve_default W=<n>             — approve dialog (Enter = option 1)
 #   approve_edit    W=<n>             — approve "allow all edits" (option 2)
+#   compact         W=<n>             — send /compact to Claude Code
 #   dismiss_survey  W=<n>             — dismiss Claude Code survey modal
 #   activate_goal   W=<n>             — activate pending goal (Enter)
 #   nudge_goal      W=<n> TEXT=<msg>  — send /goal <msg> 30m
@@ -65,7 +66,7 @@ send_submit() {
 send_then_enter() {
   local text="$1"
   "${TMPL[@]}" send-keys -t "${SESSION}:${W}" -- "$text"
-  sleep 0.5
+  sleep 2.0
   send_enter
 }
 
@@ -73,7 +74,7 @@ send_then_enter() {
 send_then_submit() {
   local text="$1"
   "${TMPL[@]}" send-keys -t "${SESSION}:${W}" -- "$text"
-  sleep 0.5
+  sleep 2.0
   send_submit
 }
 
@@ -108,6 +109,11 @@ case "$ACTION" in
     "${TMPL[@]}" send-keys -t "${SESSION}:${W}" Down
     sleep 0.5
     send_submit
+    ;;
+
+  compact)
+    [[ -z "$W" ]] && { echo "ERROR: W required"; exit 1; }
+    send_then_submit "/compact"
     ;;
 
   activate_goal)
