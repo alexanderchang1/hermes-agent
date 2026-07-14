@@ -127,6 +127,8 @@ def should_send_media_as_audio(platform, ext: str, is_voice: bool = False) -> bo
         if normalized_ext in _TELEGRAM_VOICE_EXTS:
             return is_voice
         return normalized_ext in _TELEGRAM_AUDIO_ATTACHMENT_EXTS
+    if _platform_name(platform) == "email":
+        return False
     return True
 
 

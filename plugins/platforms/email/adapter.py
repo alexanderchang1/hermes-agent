@@ -741,6 +741,88 @@ class EmailAdapter(BasePlatformAdapter):
         for msg_data in messages:
             await self._dispatch_message(msg_data)
 
+    def _fetch_by_uids(self, uids: list) -> List[Dict[str, Any]]:
+        """Fetch messages by specific UIDs. Runs in executor thread.
+
+        Models after _fetch_new_messages but fetches specific UIDs
+        instead of scanning for UNSEEN messages.
+        """
+        results = []
+        try:
+            imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
+            try:
+                imap.login(self._address, self._password)
+                _send_imap_id(imap)
+                imap.select("INBOX")
+
+                uid_str = ",".join(u.decode() if isinstance(u, bytes) else str(u) for u in uids)
+                status, data = imap.uid("fetch", uid_str, "(RFC822)")
+                if status != "OK" or not data or not data[0]:
+                    return results
+
+                for entry in data:
+                    if not isinstance(entry, tuple) or len(entry) != 2:
+                        continue
+                    msg_id, raw_segment = entry
+                    raw_email = raw_segment
+                    msg = email_lib.message_from_bytes(raw_email)
+
+                    sender_raw = msg.get("From", "")
+                    sender_addr = _extract_email_address(sender_raw)
+                    sender_name = _decode_header_value(sender_raw)
+                    if "<" in sender_name:
+                        sender_name = sender_name.split("<")[0].strip().strip('"')
+
+                    # Find the UID for this message from the FETCH response
+                    # The UID is embedded in the FETCH response; extract from the original uid list
+                    # Map by iterating the UID list — IMAP returns them in the same order
+                    # but we need to match. Use the response data's UID attribute.
+                    msg_uid = b""
+                    if isinstance(msg_id, bytes):
+                        # Parse: "1 (UID 25 RFC822 ...)" or similar
+                        parts = msg_id.split()
+                        for i, p in enumerate(parts):
+                            if p.upper() == b"UID" and i + 1 < len(parts):
+                                msg_uid = parts[i + 1]
+                                break
+
+                    subject = _decode_header_value(msg.get("Subject", "(no subject)"))
+                    message_id = msg.get("Message-ID", "")
+                    in_reply_to = msg.get("In-Reply-To", "")
+                    msg_headers = dict(msg.items())
+
+                    if _is_automated_sender(sender_addr, msg_headers):
+                        continue
+
+                    sender_authenticated, auth_reason = _verify_sender_authentication(
+                        msg, sender_addr, authserv_id=self._authserv_id
+                    )
+
+                    body = _extract_text_body(msg)
+                    attachments = _extract_attachments(msg, skip_attachments=self._skip_attachments)
+
+                    results.append({
+                        "uid": msg_uid,
+                        "sender_addr": sender_addr,
+                        "sender_name": sender_name,
+                        "subject": subject,
+                        "message_id": message_id,
+                        "in_reply_to": in_reply_to,
+                        "body": body,
+                        "attachments": attachments,
+                        "date": msg.get("Date", ""),
+                        "sender_authenticated": sender_authenticated,
+                        "auth_reason": auth_reason,
+                    })
+            finally:
+                try:
+                    imap.logout()
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.error("[Email] IMAP fetch_by_uids error: %s", e)
+        return results
+
     def _fetch_new_messages(self) -> List[Dict[str, Any]]:
         """Fetch new (unseen) messages from IMAP. Runs in executor thread."""
         results = []
@@ -751,7 +833,7 @@ class EmailAdapter(BasePlatformAdapter):
                 _send_imap_id(imap)
                 imap.select("INBOX")
 
-                status, data = imap.uid("search", None, "UNSEEN")
+                status, data = imap.uid("search", None, "ALL")
                 if status != "OK" or not data or not data[0]:
                     return results
 
