@@ -8,6 +8,21 @@ import hermes_state
 from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
 
 
+@pytest.fixture(autouse=True)
+def _force_reactive_wal_path(monkeypatch):
+    """Pin the proactive network-FS detector OFF for this module.
+
+    These tests assert WAL/schema behavior on synthetic DBs and assume a
+    WAL-capable filesystem. Some CI/HPC runners place the pytest tmpdir on NFS,
+    where the real detector returns True and ``apply_wal_with_fallback`` would
+    proactively use DELETE instead of WAL — flipping ``journal_mode`` assertions.
+    Pinning it False keeps these tests deterministic anywhere. The proactive
+    network-FS skip is covered in ``tests/test_wal_network_fs_skip.py``.
+    """
+    monkeypatch.setattr(hermes_state, "_is_wal_hostile_filesystem", lambda p: False)
+    yield
+
+
 class _NoFtsCursor(sqlite3.Cursor):
     """Simulate a SQLite build without the fts5 module."""
 

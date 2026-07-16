@@ -338,45 +338,236 @@ def _apply_macos_checkpoint_barrier(conn: sqlite3.Connection) -> None:
         pass
 
 
+# Linux statfs f_type magic numbers for filesystems where SQLite's WAL mode
+# (shared-memory coordination + fcntl byte-range locks) is unreliable and raises
+# SQLITE_PROTOCOL "locking protocol".  Used to avoid ever *arming* WAL on such
+# mounts — see apply_wal_with_fallback.
+_WAL_HOSTILE_FS_MAGIC = frozenset({
+    0x6969,        # NFS_SUPER_MAGIC
+    0x517B,        # SMB_SUPER_MAGIC (smbfs)
+    0xFF534D42,    # CIFS_MAGIC_NUMBER
+    0xFE534D42,    # SMB2_MAGIC_NUMBER
+    0x65735546,    # FUSE_SUPER_MAGIC
+})
+
+# Dedup for the one-time "using DELETE on network FS" INFO, keyed by db_label
+# (mirrors _wal_fallback_warned_paths above).
+_wal_skip_warned_paths: set[str] = set()
+_wal_skip_warned_lock = threading.Lock()
+
+
+def _connection_main_db_path(conn: sqlite3.Connection) -> Optional[str]:
+    """Return the filesystem path of the connection's ``main`` database.
+
+    Returns None for an in-memory/temporary DB or if the pragma is unavailable.
+    ``PRAGMA database_list`` is a pure read needing no WAL/SHM locks, so it works
+    even when the journal-mode probe has already failed on a network FS.
+    """
+    try:
+        for _seq, name, filename in conn.execute("PRAGMA database_list"):
+            if name == "main":
+                return filename or None
+    except sqlite3.Error:
+        return None
+    return None
+
+
+def _filesystem_magic(path: str) -> Optional[int]:
+    """Return the Linux ``statfs`` ``f_type`` magic for ``path`` (Linux-only).
+
+    Best-effort: any failure (non-Linux, missing libc, path gone) returns None so
+    callers keep their default WAL behavior. If ``path`` does not exist yet (DB
+    not created), statfs its parent directory — the same filesystem.
+    """
+    if sys.platform != "linux":
+        return None
+    try:
+        import ctypes
+        import os
+
+        class _Statfs(ctypes.Structure):
+            _fields_ = [
+                ("f_type", ctypes.c_long),
+                ("f_bsize", ctypes.c_long),
+                ("f_blocks", ctypes.c_ulong),
+                ("f_bfree", ctypes.c_ulong),
+                ("f_bavail", ctypes.c_ulong),
+                ("f_files", ctypes.c_ulong),
+                ("f_ffree", ctypes.c_ulong),
+                ("f_fsid", ctypes.c_int * 2),
+                ("f_namelen", ctypes.c_long),
+                ("f_frsize", ctypes.c_long),
+                ("f_flags", ctypes.c_long),
+                ("f_spare", ctypes.c_long * 4),
+            ]
+
+        target = path
+        if not os.path.exists(target):
+            target = os.path.dirname(os.path.abspath(target)) or "."
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.statfs.argtypes = [ctypes.c_char_p, ctypes.POINTER(_Statfs)]
+        libc.statfs.restype = ctypes.c_int
+        buf = _Statfs()
+        if libc.statfs(os.fsencode(target), ctypes.byref(buf)) != 0:
+            return None
+        return int(buf.f_type)
+    except Exception:
+        return None
+
+
+def _is_wal_hostile_filesystem(path: str) -> bool:
+    """Return True when ``path`` lives on NFS/SMB/CIFS/FUSE.
+
+    On those filesystems WAL's fcntl byte-range locks are unreliable and SQLite
+    raises SQLITE_PROTOCOL ("locking protocol"). Arming WAL there persists
+    ``write_ver=2`` on a node where locking transiently succeeds and then breaks
+    every open on a lock-failing node.
+    """
+    magic = _filesystem_magic(path)
+    if magic is None:
+        return False
+    return magic in _WAL_HOSTILE_FS_MAGIC or (magic & 0xFFFFFFFF) in _WAL_HOSTILE_FS_MAGIC
+
+
+def _log_wal_skip_once(db_label: str, path: str) -> None:
+    """Log a single INFO per (process, db_label): WAL skipped on a network FS in
+    favor of rollback-journal (DELETE) mode."""
+    with _wal_skip_warned_lock:
+        if db_label in _wal_skip_warned_paths:
+            return
+        _wal_skip_warned_paths.add(db_label)
+    logger.info(
+        "%s: %s is on a network/FUSE filesystem — using rollback-journal "
+        "(DELETE) mode instead of WAL, which is unreliable there "
+        "(SQLITE_PROTOCOL 'locking protocol'). Reduces write concurrency but "
+        "avoids silent session-store failures. See https://www.sqlite.org/wal.html.",
+        db_label,
+        path,
+    )
+
+
+def _on_disk_write_version(path: str) -> Optional[int]:
+    """Return the SQLite header write-version byte (offset 18) for ``path``.
+
+    ``1`` = rollback journal (DELETE/TRUNCATE/…), ``2`` = WAL. Returns None for
+    a new/empty/short/unreadable file. This reads raw header bytes and takes NO
+    locks — safe on NFS even when a live ``PRAGMA journal_mode`` would raise
+    SQLITE_PROTOCOL ("locking protocol").
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(19)
+    except OSError:
+        return None
+    if len(head) < 19:
+        return None
+    return head[18]
+
+
+def _hostile_fs_journal_mode(
+    conn: sqlite3.Connection,
+    db_path: str,
+    db_label: str,
+    current: Optional[str],
+) -> str:
+    """Drive a DB on a network/FUSE filesystem to DELETE (rollback) journal mode.
+
+    Self-healing: an already-WAL DB (armed on a prior node, or by older code)
+    is *converted* to DELETE here whenever locking works on this node — so it
+    stops breaking on lock-failing nodes — rather than being preserved as WAL.
+
+    Returns the journal mode actually in effect:
+      * ``"delete"`` — converted or already rollback (the normal outcome).
+      * ``"wal"``     — another live connection holds WAL and SQLite refuses to
+                        downgrade; the file is genuinely shared-WAL and usable.
+    Raises ``OperationalError`` when the DB is WAL on disk but locking is broken
+    here (can't open or convert), so the caller can fall back cleanly (JSONL).
+    """
+    on_disk = _on_disk_write_version(db_path)
+    try:
+        # Checkpointing is required before a WAL DB can leave WAL mode.
+        if current == "wal" or on_disk == 2:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        row = conn.execute("PRAGMA journal_mode=DELETE").fetchone()
+        mode = row[0].lower() if row and row[0] else ""
+    except sqlite3.OperationalError as exc:
+        if not any(m in str(exc).lower() for m in _WAL_INCOMPAT_MARKERS):
+            # A real error (I/O, corruption, "not a database") — never mask it.
+            raise
+        # Locking failed on this node. A WAL-on-disk file can't be opened here;
+        # re-raise for a clean caller fallback. A DELETE-on-disk file is already
+        # in the right mode — report it.
+        if on_disk == 2:
+            raise
+        _log_wal_skip_once(db_label, db_path)
+        return "delete"
+    if mode == "delete":
+        _log_wal_skip_once(db_label, db_path)
+        return "delete"
+    if mode == "wal":
+        # Another live connection holds WAL; SQLite won't downgrade while it's
+        # open. The file is genuinely shared-WAL and usable on this node.
+        _apply_macos_checkpoint_barrier(conn)
+        return "wal"
+    # Unexpected non-rollback, non-WAL result (e.g. "memory"/"off") — report it.
+    return mode or "delete"
+
+
 def apply_wal_with_fallback(
     conn: sqlite3.Connection,
     *,
     db_label: str = "state.db",
 ) -> str:
-    """Set ``journal_mode=WAL`` on ``conn``, falling back to DELETE on failure.
+    """Choose the right journal mode for ``conn``; return it (``"wal"``/``"delete"``).
 
-    Returns the journal mode actually set (``"wal"`` or ``"delete"``).
+    Behavior by filesystem:
 
-    On WAL-incompatible filesystems (NFS, SMB, some FUSE), SQLite raises
-    ``OperationalError("locking protocol")`` when setting WAL.  We fall
-    back to DELETE mode — the pre-WAL default, which works on NFS — and
-    log one WARNING explaining why.
+    * **Network/FUSE (NFS, SMB, some FUSE)** — detected via a lock-free
+      ``statfs``. WAL's fcntl byte-range locks are unreliable there
+      (SQLITE_PROTOCOL "locking protocol"). We never *arm* WAL, and we
+      *self-heal*: an already-WAL DB is converted to DELETE whenever locking
+      works on this node (so it stops breaking on lock-failing nodes). If the
+      DB is WAL on disk but locking is broken here, we re-raise so the caller
+      falls back cleanly (e.g. JSONL). See ``_hostile_fs_journal_mode``.
+    * **Other filesystems** — attempt WAL; fall back to DELETE on a WAL-incompat
+      marker, and don't downgrade a DB that is already WAL on disk (avoids
+      corrupting a mixed-mode file).
 
-    The WARNING is deduplicated per ``db_label``: repeated connections
-    to the same underlying DB (e.g. kanban_db.connect() which is called
-    on every kanban operation) log once per process, not once per call.
-    Different db_labels log independently, so state.db and kanban.db
-    each get one warning on the same NFS mount.
-
-    Shared by :class:`SessionDB` and ``hermes_cli.kanban_db.connect`` so
-    both databases get identical fallback behavior.
-
-    Never downgrades to DELETE if the on-disk DB header reports WAL — see _on_disk_journal_mode.
+    The FS-skip INFO and the fallback WARNING are each deduplicated per
+    ``db_label``. Shared by :class:`SessionDB`, ``hermes_cli.kanban_db.connect``,
+    ``agent.verification_evidence`` and others so every DB behaves identically.
     """
+    # Filesystem check is lock-free (PRAGMA database_list + statfs), so it is
+    # valid even when the journal-mode probe below raises on a flaky NFS mount.
+    db_path = _connection_main_db_path(conn)
+    hostile = bool(db_path) and _is_wal_hostile_filesystem(db_path)
+
     # Read-only probe — no flock, no checkpoint, no WAL/SHM unlink.
-    # Skipping the set-pragma prevents WAL-init from unlinking files other connections hold open.
+    current: Optional[str] = None
     try:
-        current_mode = conn.execute("PRAGMA journal_mode").fetchone()
-        if current_mode and current_mode[0] == "wal":
+        row = conn.execute("PRAGMA journal_mode").fetchone()
+        current = row[0].lower() if row and row[0] else None
+        if current == "wal" and not hostile:
             _apply_macos_checkpoint_barrier(conn)
             return "wal"
     except sqlite3.OperationalError:
-        pass
+        current = None
 
+    # Network/FUSE filesystem: never keep WAL — self-heal toward DELETE.
+    if hostile:
+        return _hostile_fs_journal_mode(conn, db_path, db_label, current)
+
+    # Non-hostile filesystem: attempt WAL, fall back to DELETE on a WAL marker.
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
-        _apply_macos_checkpoint_barrier(conn)
-        return "wal"
+        row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        # SQLite can return a mode other than "wal" WITHOUT raising (e.g. the FS
+        # silently refuses WAL). Trust the returned value, not the request.
+        if row and row[0] and row[0].lower() == "wal":
+            _apply_macos_checkpoint_barrier(conn)
+            return "wal"
+        # WAL not actually engaged — normalize to DELETE explicitly.
+        conn.execute("PRAGMA journal_mode=DELETE")
+        return "delete"
     except sqlite3.OperationalError as exc:
         msg = str(exc).lower()
         if not any(marker in msg for marker in _WAL_INCOMPAT_MARKERS):

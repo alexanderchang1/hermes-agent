@@ -63,7 +63,12 @@ def _connect() -> sqlite3.Connection:
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
-    conn.execute("PRAGMA journal_mode=WAL")
+    # Route journal-mode selection through the shared helper so WAL is never
+    # armed on a network/FUSE filesystem (NFS HERMES_HOME), where it raises
+    # SQLITE_PROTOCOL "locking protocol" and would persist an unopenable
+    # write_ver=2 file. Falls back to / stays in DELETE there.
+    from hermes_state import apply_wal_with_fallback
+    apply_wal_with_fallback(conn, db_label="verification_evidence.db")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.row_factory = sqlite3.Row
     _ensure_schema(conn)

@@ -71,6 +71,22 @@ def _reset_wal_fallback_warned_paths():
     hermes_state._wal_fallback_warned_paths.clear()
 
 
+@pytest.fixture(autouse=True)
+def _force_reactive_wal_path(monkeypatch):
+    """Pin the proactive network-FS detector OFF for this module.
+
+    These tests exercise the *reactive* WAL→DELETE fallback (WAL is attempted,
+    then downgraded on a ``locking protocol`` error). That path only runs when
+    the filesystem was NOT proactively detected as WAL-hostile. Some CI/HPC
+    runners put the pytest tmpdir on NFS, where the real detector returns True
+    and would proactively skip WAL — preempting the very path under test. Pin it
+    False so these tests are deterministic everywhere. The proactive skip has
+    its own coverage in ``test_wal_network_fs_skip.py``.
+    """
+    monkeypatch.setattr(hermes_state, "_is_wal_hostile_filesystem", lambda p: False)
+    yield
+
+
 class TestApplyWalWithFallback:
     def test_succeeds_on_local_fs(self, tmp_path):
         """Happy path: WAL works on a normal filesystem."""

@@ -361,6 +361,27 @@ def _command_line_belongs_to_profile(command: str, profile_home: Path) -> bool:
     return True
 
 
+def _command_line_is_hermes_binary(command: str | None) -> bool:
+    """Return True when a command line still runs the ``hermes`` entry point.
+
+    Distinguishes a gateway that self-relaunched in place — its argv no longer
+    carries the ``gateway run`` subcommand (``build_relaunch_argv`` appends only
+    inherited flags + extra_args), but argv still invokes ``hermes`` — from an
+    unrelated process that recycled the PID and happens to expose a readable,
+    non-gateway command line.
+    """
+    if not command:
+        return False
+    lowered = command.lower()
+    if "hermes_cli" in lowered:  # ``python -m hermes_cli.main`` relaunch form
+        return True
+    for part in command.split():
+        base = part.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+        if base in ("hermes", "hermes.exe"):
+            return True
+    return False
+
+
 def _record_matches_live_gateway_pid(
     record: dict[str, Any],
     pid: int,
@@ -380,16 +401,38 @@ def _record_matches_live_gateway_pid(
     profile's live gateway would make the dead profile look alive.  When the
     live command line cannot be read (Windows/permission), fall back to the
     persisted record so cross-platform behavior is preserved.
+
+    A readable-but-truncated cmdline (bare ``hermes`` with no ``gateway run``
+    subcommand) is treated as a live gateway when the persisted record — already
+    matched to this PID by ``start_time`` in ``get_running_pid`` — identifies a
+    gateway and the live image is still the ``hermes`` binary. This is what a
+    gateway that self-relaunched in place (``os.execvp``) looks like, and without
+    this rescue ``--replace`` fails to see the running gateway and spawns a
+    duplicate that fights it over the bot token, mailbox, and state.db.
     """
     live_cmdline = _read_process_cmdline(pid)
     if live_cmdline:
-        if not looks_like_gateway_runtime_command_line(live_cmdline):
-            return False
-        if expected_home is not None and not _command_line_belongs_to_profile(
-            live_cmdline, expected_home
+        if looks_like_gateway_runtime_command_line(live_cmdline):
+            if expected_home is not None and not _command_line_belongs_to_profile(
+                live_cmdline, expected_home
+            ):
+                return False
+            return True
+        # Readable cmdline that lacks a ``gateway run``/``restart`` subcommand.
+        # An in-place self-relaunch (``os.execvp`` — same PID — via
+        # build_relaunch_argv, which drops the ``gateway run`` positional) or a
+        # setproctitle rewrite leaves the live cmdline as bare ``hermes`` while
+        # the process is still the gateway. Trust the persisted record's argv
+        # (already start_time-matched by the caller) when it identifies a gateway
+        # and the live image is still hermes. Stay strict under expected_home:
+        # a truncated cmdline can't be attributed to a specific profile.
+        if (
+            expected_home is None
+            and _command_line_is_hermes_binary(live_cmdline)
+            and _record_looks_like_gateway(record)
         ):
-            return False
-        return True
+            return True
+        return False
     return _record_looks_like_gateway(record)
 
 
