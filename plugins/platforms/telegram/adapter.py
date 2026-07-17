@@ -1814,9 +1814,29 @@ class TelegramAdapter(BasePlatformAdapter):
         delete_webhook = getattr(self._bot, "delete_webhook", None)
         if not callable(delete_webhook):
             return True
+        # Timebox the call. deleteWebhook runs inside connect(), which the
+        # gateway wraps in a single connect budget that start_polling also
+        # needs. Under event-loop starvation on a loaded host, httpx's own
+        # read_timeout may not fire promptly (the loop is CPU-starved), so an
+        # unbounded await here can silently burn the whole budget before
+        # polling ever starts. This is best-effort — a hang past the timebox is
+        # treated exactly like a recoverable network error: degrade to polling
+        # and let getUpdates/the reconnect ladder recover.
+        _timeout = env_float("HERMES_TELEGRAM_DELETE_WEBHOOK_TIMEOUT", 15.0)
         try:
-            await delete_webhook(drop_pending_updates=False)
+            await asyncio.wait_for(
+                delete_webhook(drop_pending_updates=False), timeout=_timeout
+            )
             return True
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[%s] deleteWebhook did not complete within %.0fs (event-loop "
+                "starvation?); continuing to polling so getUpdates/retry can "
+                "recover",
+                self.name, _timeout,
+            )
+            self._send_path_degraded = True
+            return False
         except Exception as err:
             if self._looks_like_network_error(err):
                 logger.warning(

@@ -745,6 +745,34 @@ async def test_delete_webhook_network_error_is_recoverable():
 
 
 @pytest.mark.asyncio
+async def test_delete_webhook_hang_is_timeboxed(monkeypatch):
+    """deleteWebhook must not consume the connect budget when it HANGS.
+
+    Under event-loop starvation on a loaded host, deleteWebhook can stall
+    without ever raising (httpx read_timeout may not fire promptly when the
+    loop is CPU-starved). Left unbounded, it burns the gateway's connect
+    timeout that start_polling actually needs. The call is best-effort, so a
+    hang past the timebox must degrade to polling recovery (return False,
+    mark send path degraded) rather than block bootstrap.
+    """
+    monkeypatch.setenv("HERMES_TELEGRAM_DELETE_WEBHOOK_TIMEOUT", "0.05")
+    adapter = _make_adapter()
+    mock_bot = MagicMock()
+
+    async def _hang(*_args, **_kwargs):
+        await asyncio.sleep(30)
+
+    mock_bot.delete_webhook = AsyncMock(side_effect=_hang)
+    adapter._bot = mock_bot
+
+    result = await asyncio.wait_for(adapter._delete_webhook_best_effort(), timeout=5)
+
+    assert result is False
+    assert adapter._send_path_degraded is True
+    assert not adapter.has_fatal_error
+
+
+@pytest.mark.asyncio
 async def test_polling_bootstrap_network_error_schedules_background_recovery():
     """Initial start_polling() network failure should degrade, not raise."""
     adapter = _make_adapter()
