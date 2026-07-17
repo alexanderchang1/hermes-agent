@@ -537,6 +537,7 @@ class EmailAdapter(BasePlatformAdapter):
         self._seen_uids: set = set()
         self._seen_uids_max: int = 2000   # cap to prevent unbounded memory growth
         self._poll_task: Optional[asyncio.Task] = None
+        self._catchup_task: Optional[asyncio.Task] = None
 
         # Map chat_id (sender email) -> last subject + message-id for threading
         self._thread_context: Dict[str, Dict[str, str]] = {}
@@ -648,64 +649,61 @@ class EmailAdapter(BasePlatformAdapter):
             return _connect(ipv4_only=True)
 
     async def connect(self, is_reconnect: bool = False) -> bool:
-        """Connect to the IMAP server, seed seen-UIDs from completed store,
-        and catch-up any messages that were never completed (e.g. from a
-        previous gateway crash or downtime)."""
+        """Verify IMAP + SMTP connectivity and start polling.
+
+        The gateway wraps this call in a ~30s connect budget, and any blocking
+        work here stalls every other platform's event loop. So connect() does
+        only a fast credential/connectivity check (bare IMAP + SMTP LOGIN,
+        sub-second) run off the loop in an executor. The slow parts — SELECT
+        INBOX + UID SEARCH ALL, which can each stall ~10s under Gmail
+        throttling — plus the catch-up dispatch are deferred to a background
+        task (`_run_catchup`) so server latency can never blow the connect
+        budget or block other platforms (mirrors the Telegram #46298 fix).
+        """
+        # ── 0. Fail fast on missing configuration (a permanent error, not a
+        #    transient outage) so the gateway stops reconnecting (#40715). ──
+        if not self._imap_host:
+            message = (
+                "EMAIL_IMAP_HOST is not set — cannot connect to IMAP. "
+                "Set EMAIL_IMAP_HOST (e.g. imap.gmail.com) and restart."
+            )
+            logger.error("[Email] %s", message)
+            self._set_fatal_error(
+                "email_missing_configuration", message, retryable=False
+            )
+            return False
+
         # ── 1. Load completed UIDs from persistent store ──
         completed_uids = self._load_completed_uids()
         logger.info("[Email] Loaded %d completed message UIDs", len(completed_uids))
         self._seen_uids = {u.encode() if isinstance(u, str) else u for u in completed_uids}
         self._trim_seen_uids()
 
+        loop = asyncio.get_running_loop()
+
+        # ── 2. Verify IMAP + SMTP credentials (fast, off the event loop) ──
         try:
-            # ── 2. Test IMAP connection + discover uncompleted messages ──
-            imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
-            imap.login(self._address, self._password)
-            _send_imap_id(imap)
-            imap.select("INBOX")
-
-            status, data = imap.uid("search", None, "ALL")
-            catchup_uids: list = []
-            if status == "OK" and data and data[0]:
-                for uid in data[0].split():
-                    if uid not in self._seen_uids:
-                        catchup_uids.append(uid)
-            imap.logout()
-
-            logger.info(
-                "[Email] IMAP connection test passed. %d completed skipped, "
-                "%d uncompleted messages for catch-up.",
-                len(self._seen_uids), len(catchup_uids),
-            )
+            await loop.run_in_executor(None, self._verify_imap_login)
         except Exception as e:
             logger.error("[Email] IMAP connection failed: %s", e)
             return False
 
         try:
-            # Test SMTP connection
-            smtp = self._connect_smtp()
-            try:
-                smtp.login(self._address, self._password)
-            finally:
-                smtp.quit()
-            logger.info("[Email] SMTP connection test passed.")
+            await loop.run_in_executor(None, self._verify_smtp_login)
         except Exception as e:
             logger.error("[Email] SMTP connection failed: %s", e)
             return False
 
+        logger.info("[Email] IMAP + SMTP connection test passed.")
+
         self._running = True
         self._poll_task = asyncio.create_task(self._poll_loop())
 
-        # ── 3. Catch-up: dispatch any messages found on the server that
-        #    were never marked completed (arrived during downtime, or a
-        #    previous dispatch failed mid-way).
-        if catchup_uids:
-            loop = asyncio.get_running_loop()
-            catchup_msgs = await loop.run_in_executor(
-                None, self._fetch_by_uids, catchup_uids
-            )
-            for msg_data in catchup_msgs:
-                await self._dispatch_message(msg_data)
+        # ── 3. Catch-up runs in the background: discover messages found on the
+        #    server that were never marked completed (arrived during downtime,
+        #    or a previous dispatch failed mid-way) and dispatch them. Kept off
+        #    the connect path so a slow SELECT/SEARCH cannot time out connect().
+        self._catchup_task = asyncio.create_task(self._run_catchup())
 
         print(f"[Email] Connected as {self._address}")
         return True
@@ -713,13 +711,17 @@ class EmailAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Stop polling and disconnect."""
         self._running = False
-        if self._poll_task:
-            self._poll_task.cancel()
-            try:
-                await self._poll_task
-            except asyncio.CancelledError:
-                pass
-            self._poll_task = None
+        for attr in ("_poll_task", "_catchup_task"):
+            task = getattr(self, attr, None)
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:  # noqa: BLE001 — best-effort teardown
+                    pass
+                setattr(self, attr, None)
         logger.info("[Email] Disconnected.")
 
     async def _poll_loop(self) -> None:
@@ -822,6 +824,89 @@ class EmailAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("[Email] IMAP fetch_by_uids error: %s", e)
         return results
+
+    def _verify_imap_login(self) -> None:
+        """Blocking: verify IMAP credentials with a bare LOGIN (+ RFC 2971 ID).
+
+        Runs in an executor thread. Deliberately does NOT SELECT/SEARCH — those
+        can each stall ~10s and would blow the gateway's ~30s connect budget;
+        that work is deferred to `_run_catchup`.
+        """
+        imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
+        try:
+            imap.login(self._address, self._password)
+            _send_imap_id(imap)
+        finally:
+            try:
+                imap.logout()
+            except Exception:
+                pass
+
+    def _verify_smtp_login(self) -> None:
+        """Blocking: verify SMTP credentials. Runs in an executor thread."""
+        smtp = self._connect_smtp()
+        try:
+            smtp.login(self._address, self._password)
+        finally:
+            smtp.quit()
+
+    def _discover_catchup_uids(self) -> list:
+        """Blocking: SELECT INBOX + UID SEARCH ALL, returning UIDs that were
+        never marked completed. Runs in an executor thread (never the event
+        loop) because SELECT/SEARCH can each stall ~10s.
+        """
+        catchup_uids: list = []
+        imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
+        try:
+            imap.login(self._address, self._password)
+            _send_imap_id(imap)
+            imap.select("INBOX")
+            status, data = imap.uid("search", None, "ALL")
+            if status == "OK" and data and data[0]:
+                for uid in data[0].split():
+                    if uid not in self._seen_uids:
+                        catchup_uids.append(uid)
+        finally:
+            try:
+                imap.logout()
+            except Exception:
+                pass
+        return catchup_uids
+
+    async def _run_catchup(self) -> None:
+        """Background task: discover and dispatch messages found on the server
+        that were never marked completed (arrived during downtime, or a prior
+        dispatch failed mid-way). Kept off the connect path so a slow
+        SELECT/SEARCH cannot time out connect() or block the event loop.
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            catchup_uids = await loop.run_in_executor(None, self._discover_catchup_uids)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — best-effort catch-up
+            logger.error("[Email] Catch-up discovery failed: %s", e)
+            return
+
+        if not catchup_uids:
+            return
+
+        logger.info(
+            "[Email] Catch-up: %d uncompleted message(s) to dispatch",
+            len(catchup_uids),
+        )
+        try:
+            catchup_msgs = await loop.run_in_executor(
+                None, self._fetch_by_uids, catchup_uids
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.error("[Email] Catch-up fetch failed: %s", e)
+            return
+
+        for msg_data in catchup_msgs:
+            await self._dispatch_message(msg_data)
 
     def _fetch_new_messages(self) -> List[Dict[str, Any]]:
         """Fetch new (unseen) messages from IMAP. Runs in executor thread."""

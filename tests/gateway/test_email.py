@@ -1126,23 +1126,40 @@ class TestConnectDisconnect(unittest.TestCase):
         adapter = self._make_adapter()
 
         mock_imap = MagicMock()
+        # SEARCH ALL returns UIDs 1-3; all are already completed (seeded below)
+        # so catch-up finds nothing to dispatch — the assertion stays hermetic
+        # rather than coupling to the live completed-UIDs cache file on disk.
         mock_imap.uid.return_value = ("OK", [b"1 2 3"])
 
         with patch("imaplib.IMAP4_SSL", return_value=mock_imap), \
-             patch("smtplib.SMTP") as mock_smtp:
+             patch("smtplib.SMTP") as mock_smtp, \
+             patch.object(adapter, "_load_completed_uids",
+                          return_value={"1", "2", "3"}):
             mock_server = MagicMock()
             mock_smtp.return_value = mock_server
 
-            result = asyncio.run(adapter.connect())
+            async def _connect_and_await_catchup():
+                ok = await adapter.connect()
+                # Catch-up (SELECT/SEARCH + dispatch) now runs as a background
+                # task off the connect budget; await it so the assertions below
+                # observe the fully-settled end state.
+                if adapter._catchup_task:
+                    await adapter._catchup_task
+                return ok
+
+            result = asyncio.run(_connect_and_await_catchup())
 
             self.assertTrue(result)
             self.assertTrue(adapter._running)
-            # Should have skipped existing messages
-            self.assertEqual(len(adapter._seen_uids), 3)
+            # Completed UIDs seed the seen-set; the 3 existing messages are
+            # skipped (already completed), so seen holds exactly those 3.
+            self.assertEqual(adapter._seen_uids, {b"1", b"2", b"3"})
             # Cleanup
             adapter._running = False
             if adapter._poll_task:
                 adapter._poll_task.cancel()
+            if adapter._catchup_task:
+                adapter._catchup_task.cancel()
 
     def test_connect_imap_failure(self):
         """IMAP connection failure returns False."""
