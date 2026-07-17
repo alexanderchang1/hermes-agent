@@ -10089,7 +10089,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _result = await self._handle_delegate_command(event)
                 if _result is not None:
                     return _result
-                # Fall through — text was rewritten for the agent
+                # Queue the rewritten event explicitly so it neither reaches
+                # the catch-all command guard nor interrupts the active agent.
+                # The drain calls _run_agent directly (not _handle_message), so
+                # this marker only bypasses the pending-command safety net and
+                # cannot cause /delegate to be parsed and queued again.
+                event._delegate_agent_input = True
+                adapter = self._adapter_for_source(source)
+                if adapter:
+                    self._enqueue_fifo(_quick_key, event, adapter)
+                return None
             # /kanban must bypass the guard. It writes to a profile-agnostic
             # DB (kanban.db), not to the running agent's state. In fact
             # /kanban unblock is often the only way to free a worker that
@@ -20977,7 +20986,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # as user input.  The primary fix is in base.py (commands bypass the
             # active-session guard), but this catches edge cases where command
             # text leaks through the interrupt_message fallback.
-            if pending and pending.strip().startswith("/"):
+            if (
+                pending
+                and pending.strip().startswith("/")
+                and not getattr(pending_event, "_delegate_agent_input", False)
+            ):
                 _pending_parts = pending.strip().split(None, 1)
                 _pending_cmd_word = _pending_parts[0][1:].lower() if _pending_parts else ""
                 if _pending_cmd_word:
