@@ -9404,7 +9404,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return bool(check_ids & allowed_ids)
 
-    def _get_unauthorized_dm_behavior(self, platform: Optional[Platform]) -> str:
+    def _get_unauthorized_dm_behavior(self, platform: Optional[Platform], profile: Optional[str] = None) -> str:
         """Return how unauthorized DMs should be handled for a platform.
 
         Resolution order:
@@ -11806,9 +11806,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # message (empty history or last message is not assistant).
             _last_is_assistant = False
             for _m in reversed(history):
-                if _m.get("role") == "assistant":
-                    _last_is_assistant = True
-                    break
+                if _m.get("role") == "system":
+                    continue
+                _last_is_assistant = _m.get("role") == "assistant"
+                break
             if not _last_is_assistant and _cached_response.strip():
                 logger.warning(
                     "Recovering orphaned assistant message for session %s "
