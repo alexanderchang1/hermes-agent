@@ -2886,11 +2886,28 @@ class TelegramAdapter(BasePlatformAdapter):
 
             request_kwargs = {
                 "connection_pool_size": _env_int("HERMES_TELEGRAM_HTTP_POOL_SIZE", 512),
-                "pool_timeout": _env_float("HERMES_TELEGRAM_HTTP_POOL_TIMEOUT", 8.0),
-                "connect_timeout": _env_float("HERMES_TELEGRAM_HTTP_CONNECT_TIMEOUT", 10.0),
+                "pool_timeout": _env_float("HERMES_TELEGRAM_HTTP_POOL_TIMEOUT", 15.0),
+                "connect_timeout": _env_float("HERMES_TELEGRAM_HTTP_CONNECT_TIMEOUT", 15.0),
                 "read_timeout": _env_float("HERMES_TELEGRAM_HTTP_READ_TIMEOUT", 20.0),
                 "write_timeout": _env_float("HERMES_TELEGRAM_HTTP_WRITE_TIMEOUT", 20.0),
             }
+
+            # The getUpdates long-poll holds the connection open for the poll
+            # timeout (~10s) and must survive event-loop starvation: on a heavily
+            # loaded host (shared HPC node at loadavg 70+), the asyncio loop can
+            # be denied CPU for several seconds at a time, so a read that would
+            # normally complete in <10s can take much longer in wall-clock. A
+            # tight 20s read timeout then trips a spurious httpx.ReadError, which
+            # cascades into the network-error reconnect ladder → fatal → gateway
+            # restart. Give the polling request a large read-timeout margin so
+            # transient starvation is absorbed instead of mistaken for a dead
+            # connection. (General/send requests keep the tighter timeout so a
+            # genuinely stuck send still fails fast.) Pool/connect timeouts are
+            # also loosened above for the same starvation reason.
+            get_updates_request_kwargs = dict(request_kwargs)
+            get_updates_request_kwargs["read_timeout"] = _env_float(
+                "HERMES_TELEGRAM_HTTP_POLL_READ_TIMEOUT", 75.0
+            )
 
             # CLOSE_WAIT fd leak (#31599, same class as #18451): PTB's
             # HTTPXRequest builds the underlying httpx.AsyncClient with
@@ -2957,7 +2974,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     ),
                 )
                 get_updates_request = HTTPXRequest(
-                    **request_kwargs,
+                    **get_updates_request_kwargs,
                     httpx_kwargs=_with_limits(
                         {"transport": TelegramFallbackTransport(fallback_ips)}
                     ),
@@ -2968,14 +2985,14 @@ class TelegramAdapter(BasePlatformAdapter):
                     **request_kwargs, proxy=proxy_url, httpx_kwargs=_with_limits()
                 )
                 get_updates_request = HTTPXRequest(
-                    **request_kwargs, proxy=proxy_url, httpx_kwargs=_with_limits()
+                    **get_updates_request_kwargs, proxy=proxy_url, httpx_kwargs=_with_limits()
                 )
             else:
                 if disable_fallback:
                     logger.info("[%s] Telegram fallback-IP transport disabled via env", self.name)
                 request = HTTPXRequest(**request_kwargs, httpx_kwargs=_with_limits())
                 get_updates_request = HTTPXRequest(
-                    **request_kwargs, httpx_kwargs=_with_limits()
+                    **get_updates_request_kwargs, httpx_kwargs=_with_limits()
                 )
 
             builder = builder.request(request).get_updates_request(get_updates_request)
@@ -3333,6 +3350,20 @@ class TelegramAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
         self._polling_heartbeat_task = None
+
+        # Cancel any in-flight polling recovery (conflict/network retry ladder)
+        # so it can't call start_polling() into a half-torn-down app after
+        # teardown, and clear the cross-path recovery guard so a future
+        # connect() on this instance is never blocked by a stale flag.
+        self._recovery_in_progress = False
+        polling_error_task = self._polling_error_task
+        if polling_error_task and not polling_error_task.done():
+            polling_error_task.cancel()
+            try:
+                await polling_error_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._polling_error_task = None
 
         # Mark the bot "Offline" in its short description while the bot's HTTP
         # client is still alive (before app shutdown closes it). Opt-in via
