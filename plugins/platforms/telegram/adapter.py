@@ -13,12 +13,19 @@ import inspect
 import json
 import logging
 import os
+import time
 import html as _html
 import re
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
 
 logger = logging.getLogger(__name__)
+
+# A 409 conflict arriving within this many seconds of a successful polling
+# restart is treated as the death-rattle of the abandoned getUpdates session
+# (Telegram holds it ~30-50s server-side), not a fresh conflict — so we don't
+# tear the healthy poller down again. Kept above Telegram's server-side linger.
+_POLLING_CONFLICT_COOLDOWN_SECS = 60
 
 try:
     from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
@@ -427,6 +434,15 @@ class TelegramAdapter(BasePlatformAdapter):
         # race to call start_polling() and the loser raises "This Updater is
         # already running!", which is then misread as a fresh 409 and loops.
         self._recovery_in_progress: bool = False
+        # Monotonic timestamp of the last successful polling recovery. A 409
+        # arriving within POLLING_CONFLICT_COOLDOWN_SECS of it is almost always
+        # the death-rattle of the getUpdates session we abandoned during that
+        # restart (Telegram holds it ~30-50s server-side and delivers its
+        # "terminated by other getUpdates" to our still-registered callback).
+        # We leave the healthy running poller alone in that window and let PTB's
+        # own retry ride out the stale session, which self-heals once it dies —
+        # instead of tearing down again and abandoning yet another session.
+        self._last_polling_recovery_ts: Optional[float] = None
         self._polling_heartbeat_task: Optional[asyncio.Task] = None
         # Consecutive heartbeat probes that saw queued updates the running
         # poller is not consuming. get_me() can't see this — the send path is
@@ -1920,6 +1936,7 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             self._polling_network_error_count = 0
             self._recovery_in_progress = False
+            self._last_polling_recovery_ts = time.monotonic()
             # start_polling() succeeding IS the recovery signal: the long-poll
             # connection is live again, so clear the degraded flag immediately
             # rather than blocking all outbound sends for the full
@@ -2377,6 +2394,7 @@ class TelegramAdapter(BasePlatformAdapter):
             self._polling_conflict_count = 0
             self._handling_polling_conflict = False
             self._recovery_in_progress = False
+            self._last_polling_recovery_ts = time.monotonic()
             return
 
         except Exception as retry_err:
@@ -3091,6 +3109,31 @@ class TelegramAdapter(BasePlatformAdapter):
 
                 def _polling_error_callback(error: Exception) -> None:
                     if self._looks_like_polling_conflict(error):
+                        # Death-rattle debounce: a 409 arriving shortly after a
+                        # successful restart is almost always the session we
+                        # abandoned during that restart dying on Telegram's side
+                        # (it delivers "terminated by other getUpdates" to our
+                        # still-registered callback). Reacting with another
+                        # teardown abandons yet another session whose death
+                        # triggers the next teardown — the self-perpetuating
+                        # "conflict (1/5)" loop. Inside the cooldown we leave the
+                        # healthy running poller alone and let PTB's own retry
+                        # ride it out; it self-heals once the stale session dies.
+                        # We must return BEFORE disarming PTB's retry loop, or
+                        # the poller would stop with nothing to restart it.
+                        if (
+                            not self._recovery_in_progress
+                            and self._last_polling_recovery_ts is not None
+                            and (time.monotonic() - self._last_polling_recovery_ts)
+                            < _POLLING_CONFLICT_COOLDOWN_SECS
+                        ):
+                            logger.debug(
+                                "[%s] Ignoring post-restart Telegram conflict within "
+                                "%ds cooldown (abandoned-session death-rattle); "
+                                "letting PTB retry self-heal",
+                                self.name, _POLLING_CONFLICT_COOLDOWN_SECS,
+                            )
+                            return
                         # Always disarm PTB's internal network_retry_loop FIRST.
                         # PTB wraps getUpdates in a retry loop with
                         # max_retries=-1 (infinite).  Without disarming, calling

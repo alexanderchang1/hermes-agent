@@ -298,6 +298,72 @@ async def test_polling_conflict_reconflict_during_verify_keeps_counter(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_polling_conflict_within_cooldown_is_ignored(monkeypatch):
+    """A 409 arriving shortly after a successful restart is the abandoned
+    session's death-rattle. It must NOT trigger another teardown (which would
+    abandon yet another session and perpetuate the '1/5' loop) — we leave the
+    healthy running poller alone and let PTB's own retry ride it out.
+    """
+    import time as _time
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter.set_fatal_error_handler(AsyncMock())
+    monkeypatch.setattr(
+        "gateway.status.acquire_scoped_lock",
+        lambda scope, identity, metadata=None: (True, None),
+    )
+    monkeypatch.setattr(
+        "gateway.status.release_scoped_lock", lambda scope, identity: None
+    )
+
+    captured = {}
+
+    async def fake_start_polling(**kwargs):
+        captured["error_callback"] = kwargs["error_callback"]
+
+    updater = SimpleNamespace(
+        start_polling=AsyncMock(side_effect=fake_start_polling),
+        stop=AsyncMock(),
+        running=True,
+    )
+    bot = SimpleNamespace(set_my_commands=AsyncMock(), delete_webhook=AsyncMock())
+    app = SimpleNamespace(
+        bot=bot, updater=updater, add_handler=MagicMock(),
+        initialize=AsyncMock(), start=AsyncMock(),
+    )
+    builder = MagicMock()
+    builder.token.return_value = builder
+    builder.request.return_value = builder
+    builder.get_updates_request.return_value = builder
+    builder.build.return_value = app
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter.Application",
+        SimpleNamespace(builder=MagicMock(return_value=builder)),
+    )
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
+
+    assert await adapter.connect() is True
+    callback = captured["error_callback"]
+
+    # We "just recovered" — and a full teardown would call _disarm_ptb_retry_loop.
+    adapter._last_polling_recovery_ts = _time.monotonic()
+    disarm = MagicMock()
+    monkeypatch.setattr(adapter, "_disarm_ptb_retry_loop", disarm)
+
+    conflict = type("Conflict", (Exception,), {})
+    callback(conflict("Conflict: terminated by other getUpdates request"))
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    # The death-rattle 409 was ignored: no teardown, no recovery, no fatal.
+    disarm.assert_not_called()
+    assert adapter._recovery_in_progress is False
+    assert adapter.has_fatal_error is False
+    assert adapter._polling_conflict_count == 0
+    await _cancel_heartbeat(adapter)
+
+
+@pytest.mark.asyncio
 async def test_connect_marks_retryable_fatal_error_for_startup_network_failure(monkeypatch):
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
 
