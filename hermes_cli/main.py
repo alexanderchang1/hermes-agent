@@ -291,6 +291,7 @@ from hermes_cli.subcommands.version import build_version_parser
 from hermes_cli.subcommands.update import build_update_parser
 from hermes_cli.subcommands.uninstall import build_uninstall_parser
 from hermes_cli.subcommands.dashboard import build_dashboard_parser
+from hermes_cli.subcommands.email import build_email_parser
 from hermes_cli.subcommands.gui import build_gui_parser
 from hermes_cli.subcommands.logs import build_logs_parser
 from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
@@ -5566,6 +5567,13 @@ def _desktop_launch_options() -> tuple[list[str], str]:
         else:
             disable_gpu = "auto"
     return flags, disable_gpu
+
+
+def cmd_email(args: argparse.Namespace):
+    """Email workflow testing commands."""
+    from hermes_cli.email_dispatch import email_dispatch
+
+    sys.exit(email_dispatch(args))
 
 
 def cmd_gui(args: argparse.Namespace):
@@ -12578,6 +12586,11 @@ def main():
     )
     migrate_xai.set_defaults(func=cmd_migrate_xai)
     migrate_parser.set_defaults(func=cmd_migrate)
+
+    # =========================================================================
+    # email command  (parser built in hermes_cli/subcommands/email.py)
+    # =========================================================================
+    build_email_parser(subparsers, cmd_email=cmd_email)
 
     # =========================================================================
     # gateway + proxy commands  (parsers built in hermes_cli/subcommands/gateway.py)
