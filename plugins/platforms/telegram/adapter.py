@@ -417,6 +417,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_conflict_count: int = 0
         self._polling_network_error_count: int = 0
         self._polling_error_callback_ref = None
+        self._handling_polling_conflict: bool = False
         self._polling_heartbeat_task: Optional[asyncio.Task] = None
         # Consecutive heartbeat probes that saw queued updates the running
         # poller is not consuming. get_me() can't see this — the send path is
@@ -2216,116 +2217,117 @@ class TelegramAdapter(BasePlatformAdapter):
         # client disconnects, so a new gateway starting immediately will receive
         # a 409 until that server-side session expires.
         #
-        # Strategy: stop the local updater, wait long enough for Telegram's
-        # server-side session to expire (RETRY_DELAY grows with each attempt),
-        # drain the connection pool, then restart polling.  We attempt this
-        # MAX_CONFLICT_RETRIES times before declaring a fatal error.
+        # Strategy: stop the local updater, wait for a growing back-off, drain
+        # the connection pool, then restart polling. Each attempt raises the
+        # retry counter; after MAX_CONFLICT_RETRIES failed restarts we declare a
+        # fatal error so the operator learns another consumer holds the token.
         #
-        # Crucially, a failed retry must NOT leave polling in an ambiguous
-        # state.  If start_polling() raises, the updater is neither running
-        # nor fatal — messages are silently dropped.  We schedule another
-        # retry attempt instead of returning silently, and only escalate to
-        # fatal after all retries are exhausted.
+        # The retry counter is incremented HERE — once per attempt — rather than
+        # in the sync error callback, so a direct call to this coroutine (the
+        # unit-test path) and PTB's callback path advance it identically. The
+        # callback's ``_handling_polling_conflict`` guard already prevents a
+        # duplicate recovery task from being scheduled, so no separate sync bump
+        # of the counter is needed (a second sync bump would double-count real
+        # 409s and reach the fatal ceiling twice as fast).
+        MAX_CONFLICT_RETRIES = 5
+
         self._polling_conflict_count += 1
 
-        MAX_CONFLICT_RETRIES = 5
-        # Delay grows with each attempt: 15s, 25s, 35s, 45s, 55s.
-        # Telegram server-side getUpdates sessions typically expire within
-        # 30s; the increasing back-off ensures we clear that window without
-        # hammering the API on fast-restart loops.
+        if self._polling_conflict_count > MAX_CONFLICT_RETRIES:
+            message = (
+                "Telegram polling could not recover after %d retries (%ds total wait). "
+                "The previous gateway session is still held open on Telegram's servers, "
+                "or another process is using the same bot token. "
+                "To recover: ensure no other Hermes or OpenClaw instance is running "
+                "with this token, then restart the gateway with 'hermes gateway restart'."
+                % (MAX_CONFLICT_RETRIES,
+                   sum(10 + i * 10 for i in range(1, MAX_CONFLICT_RETRIES + 1)))
+            )
+            logger.error("[%s] %s Original error: %s", self.name, message, error)
+            self._set_fatal_error("telegram_polling_conflict", message, retryable=False)
+            await self._notify_fatal_error()
+            return
+
+        # Delay grows with each attempt: 20s, 30s, 40s, 50s, 60s.
         RETRY_DELAY = 10 + (self._polling_conflict_count * 10)  # seconds
 
-        if self._polling_conflict_count <= MAX_CONFLICT_RETRIES:
-            logger.warning(
-                "[%s] Telegram polling conflict (%d/%d) — previous session still "
-                "held open on Telegram's servers. Waiting %ds for it to expire. "
-                "Error: %s",
-                self.name, self._polling_conflict_count, MAX_CONFLICT_RETRIES,
-                RETRY_DELAY, error,
-            )
-            # Stop the local updater cleanly before sleeping.  If it's already
-            # stopped (e.g. PTB raised before updater.running was set) this is
-            # a no-op.
-            try:
-                if self._app and self._app.updater and self._app.updater.running:
-                    await self._app.updater.stop()
-            except Exception:
-                pass
-
-            await asyncio.sleep(RETRY_DELAY)
-            await self._drain_polling_connections()
-
-            # Capture a stable local reference: self._app can be reassigned to
-            # None by a concurrent disconnect() while we're suspended across
-            # the awaits above (same race #55992 fixed on the network path).
-            # Re-reading self._app after that point would raise
-            # AttributeError deep inside start_polling instead of failing fast
-            # here, where the except below reschedules or escalates to fatal.
-            app = self._app
-            try:
-                if not app:
-                    raise RuntimeError("Telegram application was torn down during conflict reconnect")
-                await app.updater.start_polling(
-                    allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=False,
-                    error_callback=self._polling_error_callback_ref,
-                )
-                logger.info(
-                    "[%s] Telegram polling resumed after conflict retry %d/%d",
-                    self.name, self._polling_conflict_count, MAX_CONFLICT_RETRIES,
-                )
-                self._polling_conflict_count = 0  # reset counter on success
-                return
-            except Exception as retry_err:
-                logger.warning(
-                    "[%s] Telegram polling retry %d/%d failed: %s. "
-                    "Scheduling next attempt.",
-                    self.name, self._polling_conflict_count, MAX_CONFLICT_RETRIES,
-                    retry_err,
-                )
-                # Schedule the next retry rather than returning silently.
-                # Returning here without either restarting polling or setting
-                # a fatal error leaves the adapter in a limbo state: the
-                # gateway process is alive and reports "connected" but
-                # no messages are received or sent.
-                if self._polling_conflict_count < MAX_CONFLICT_RETRIES:
-                    # We are inside a running coroutine, so the running loop is
-                    # guaranteed to exist. asyncio.get_event_loop() is deprecated
-                    # and raises "RuntimeError: There is no current event loop in
-                    # thread 'MainThread'" on Python 3.10+ when invoked from a
-                    # context without an attached loop (which can happen when PTB
-                    # dispatches this error callback). Use get_running_loop().
-                    loop = asyncio.get_running_loop()
-                    self._polling_error_task = loop.create_task(
-                        self._handle_polling_conflict(retry_err)
-                    )
-                    return
-                # Fall through to fatal on the last retry.
-
-        # Exhausted all retries — declare a fatal error so the gateway
-        # runner can surface this clearly and the user knows to act.
-        message = (
-            "Telegram polling could not recover after %d retries (%ds total wait). "
-            "The previous gateway session is still held open on Telegram's servers, "
-            "or another process is using the same bot token. "
-            "To recover: ensure no other Hermes or OpenClaw instance is running "
-            "with this token, then restart the gateway with 'hermes gateway restart'."
-            % (MAX_CONFLICT_RETRIES, sum(10 + i * 10 for i in range(1, MAX_CONFLICT_RETRIES + 1)))
+        logger.warning(
+            "[%s] Telegram polling conflict (%d/%d) — previous session still "
+            "held open on Telegram's servers. Waiting %ds for it to expire. "
+            "Error: %s",
+            self.name, self._polling_conflict_count, MAX_CONFLICT_RETRIES,
+            RETRY_DELAY, error,
         )
-        logger.error(
-            "[%s] %s Original error: %s",
-            self.name, message, error,
-        )
-        self._set_fatal_error("telegram_polling_conflict", message, retryable=False)
+
+        # Stop the local updater cleanly before sleeping so the old long-poll
+        # session is torn down before we open a new one — overlapping sessions
+        # are exactly what produce a fresh self-inflicted 409. Wrap in a
+        # timeout: under high load the polling task's httpx request may not
+        # respond to asyncio cancellation promptly.
         try:
-            if self._app and self._app.updater:
-                await self._app.updater.stop()
-        except Exception as stop_error:
+            if self._app and self._app.updater and self._app.updater.running:
+                await asyncio.wait_for(self._app.updater.stop(), timeout=10)
+        except asyncio.TimeoutError:
             logger.warning(
-                "[%s] Failed stopping Telegram updater after exhausting conflict retries: %s",
-                self.name, stop_error, exc_info=True,
+                "[%s] Updater.stop() timed out after 10s — "
+                "continuing with conflict recovery anyway",
+                self.name,
             )
-        await self._notify_fatal_error()
+        except Exception:
+            pass
+
+        await asyncio.sleep(RETRY_DELAY)
+        await self._drain_polling_connections()
+
+        # Capture a stable local reference: self._app can be reassigned to None
+        # by a concurrent disconnect() while we're suspended across the awaits
+        # above. Re-reading self._app after that point would raise deep inside
+        # start_polling instead of failing fast here, where the except below
+        # reschedules or escalates to fatal.
+        app = self._app
+        try:
+            if not app:
+                raise RuntimeError(
+                    "Telegram application was torn down during conflict reconnect"
+                )
+
+            self._polling_conflict_callback_received = False
+
+            await app.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=False,
+                error_callback=self._polling_error_callback_ref,
+            )
+
+            logger.info(
+                "[%s] Telegram polling resumed after conflict retry %d/%d",
+                self.name, self._polling_conflict_count, MAX_CONFLICT_RETRIES,
+            )
+            self._polling_conflict_count = 0
+            self._handling_polling_conflict = False
+            return
+
+        except Exception as retry_err:
+            logger.warning(
+                "[%s] Telegram polling retry %d/%d failed: %s. "
+                "Scheduling next attempt.",
+                self.name, self._polling_conflict_count, MAX_CONFLICT_RETRIES,
+                retry_err,
+            )
+            # Reschedule via the RUNNING loop — never the deprecated
+            # asyncio.get_event_loop(), which raises "no current event loop"
+            # when PTB dispatches the error callback from a thread with no
+            # attached loop (#19471). Using create_task instead of awaiting
+            # recursively keeps the stack flat and leaves the
+            # ``_handling_polling_conflict`` guard set across attempts so PTB's
+            # callback cannot spawn a duplicate recovery task in the meantime.
+            loop = asyncio.get_running_loop()
+            self._polling_error_task = loop.create_task(
+                self._handle_polling_conflict(retry_err)
+            )
+            self._background_tasks.add(self._polling_error_task)
+            self._polling_error_task.add_done_callback(self._background_tasks.discard)
+            return
 
     async def _create_dm_topic(
         self,
@@ -3016,17 +3018,34 @@ class TelegramAdapter(BasePlatformAdapter):
                 loop = asyncio.get_running_loop()
 
                 def _polling_error_callback(error: Exception) -> None:
-                    if self._polling_error_task and not self._polling_error_task.done():
-                        return
                     if self._looks_like_polling_conflict(error):
-                        # Synchronously stop PTB's internal network_retry_loop
-                        # BEFORE scheduling our async recovery task.  PTB calls
-                        # this callback synchronously inside its loop and then
-                        # keeps polling on its own; if we only schedule a task
-                        # here, PTB's retry and our stop->restart overlap and
-                        # produce a fresh 409.  Disarming the loop now makes it
-                        # exit on its next tick so recovery owns polling alone.
+                        # Always disarm PTB's internal network_retry_loop FIRST.
+                        # PTB wraps getUpdates in a retry loop with
+                        # max_retries=-1 (infinite).  Without disarming, calling
+                        # start_polling from within _handle_polling_conflict
+                        # hangs forever: PTB calls getUpdates, gets 409,
+                        # calls error_callback (which returns early if a handler
+                        # is already running), loops back to retry — forever.
+                        # Disarming the loop now makes it exit on its next tick.
                         self._disarm_ptb_retry_loop()
+                        # Guard: if a conflict handler is already running or
+                        # scheduled, return.  This check is SYNCHRONOUS (the
+                        # error callback is a sync function), so multiple calls
+                        # in the same event-loop tick both see the same value.
+                        # Use _handling_polling_conflict as the definitive
+                        # guard since it is written BEFORE the task is created,
+                        # not by the task itself.
+                        if self._handling_polling_conflict:
+                            self._polling_conflict_callback_received = True
+                            return
+                        # Mark a recovery in flight (sync, before the task is
+                        # created) so a second callback in the same tick returns
+                        # at the guard above instead of scheduling a duplicate
+                        # task. The retry counter is bumped inside
+                        # _handle_polling_conflict (once per attempt) — not here
+                        # — so the callback path and a direct call advance it
+                        # identically.
+                        self._handling_polling_conflict = True
                         self._polling_error_task = loop.create_task(self._handle_polling_conflict(error))
                         self._background_tasks.add(self._polling_error_task)
                         self._polling_error_task.add_done_callback(self._background_tasks.discard)
