@@ -11800,7 +11800,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # it to the transcript, the next message arrives here with no
         # assistant message at the end of history.  Detect that case and
         # re-inject the cached response so the model sees what it "said."
-        if session_key and session_key in self._last_assistance_response:
+        if session_key and session_key in getattr(self, "_last_assistance_response", {}):
             _cached_response = self._last_assistance_response[session_key]
             # Only inject if the loaded transcript truly lacks the assistant
             # message (empty history or last message is not assistant).
@@ -12562,6 +12562,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # recover it if _persist_session crashed and never wrote
             # the assistant message to the transcript.
             if response and session_key:
+                if not hasattr(self, "_last_assistance_response"):
+                    self._last_assistance_response = {}
                 self._last_assistance_response[session_key] = response
 
             # Ordering contract: the agent thread already updated the contextvar
