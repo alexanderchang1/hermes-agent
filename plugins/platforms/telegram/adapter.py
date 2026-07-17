@@ -2286,15 +2286,20 @@ class TelegramAdapter(BasePlatformAdapter):
                 "To recover: ensure no other Hermes or OpenClaw instance is running "
                 "with this token, then restart the gateway with 'hermes gateway restart'."
                 % (MAX_CONFLICT_RETRIES,
-                   sum(10 + i * 10 for i in range(1, MAX_CONFLICT_RETRIES + 1)))
+                   sum(20 + i * 10 for i in range(1, MAX_CONFLICT_RETRIES + 1)))
             )
             logger.error("[%s] %s Original error: %s", self.name, message, error)
             self._set_fatal_error("telegram_polling_conflict", message, retryable=False)
             await self._notify_fatal_error()
             return
 
-        # Delay grows with each attempt: 20s, 30s, 40s, 50s, 60s.
-        RETRY_DELAY = 10 + (self._polling_conflict_count * 10)  # seconds
+        # Delay grows with each attempt: 30s, 40s, 50s, 60s, 70s. Because the
+        # counter no longer resets on a bare start_polling() return (see the
+        # verify step below), the back-off genuinely climbs across a persistent
+        # self-conflict until it outlasts Telegram's ~30-50s server-side session
+        # linger and a restart finally takes — instead of resetting to the
+        # minimum every cycle and looping forever at "1/5".
+        RETRY_DELAY = 20 + (self._polling_conflict_count * 10)  # seconds
 
         logger.warning(
             "[%s] Telegram polling conflict (%d/%d) — previous session still "
@@ -2343,6 +2348,27 @@ class TelegramAdapter(BasePlatformAdapter):
                 drop_pending_updates=False,
                 error_callback=self._polling_error_callback_ref,
             )
+
+            # Verify the new session actually holds before declaring victory.
+            # start_polling() returns as soon as PTB launches the background
+            # poller — it does NOT confirm getUpdates succeeded. On a persistent
+            # self-conflict the fresh session 409s again within a second or two,
+            # which the error callback records via _polling_conflict_callback_received
+            # (it can't spawn a rival recovery because _recovery_in_progress is
+            # still set). Give the long-poll a brief grace window, then only
+            # accept recovery if no fresh 409 came back and the updater is still
+            # running. Otherwise treat this attempt as failed so the retry
+            # counter — and its growing back-off — climbs toward the fatal
+            # ceiling instead of resetting every cycle and looping at "1/5".
+            CONFLICT_VERIFY_DELAY = 5  # seconds
+            await asyncio.sleep(CONFLICT_VERIFY_DELAY)
+            if self._polling_conflict_callback_received or not (
+                app.updater and app.updater.running
+            ):
+                raise RuntimeError(
+                    "polling re-conflicted immediately after restart "
+                    "(session still contested)"
+                )
 
             logger.info(
                 "[%s] Telegram polling resumed after conflict retry %d/%d",

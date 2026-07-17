@@ -233,6 +233,71 @@ async def test_polling_conflict_becomes_fatal_after_retries(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_polling_conflict_reconflict_during_verify_keeps_counter(monkeypatch):
+    """start_polling() returning is NOT proof of recovery.
+
+    PTB's start_polling() launches the poller and returns immediately; on a
+    persistent self-conflict the fresh session 409s again within the verify
+    grace window. The handler must then treat the attempt as failed and leave
+    the retry counter advanced — otherwise it resets to 0 every cycle and loops
+    forever at "conflict (1/5)" instead of escalating (session-linger loop).
+    """
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter.set_fatal_error_handler(AsyncMock())
+    monkeypatch.setattr(
+        "gateway.status.acquire_scoped_lock",
+        lambda scope, identity, metadata=None: (True, None),
+    )
+    monkeypatch.setattr(
+        "gateway.status.release_scoped_lock", lambda scope, identity: None
+    )
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter.Update", MagicMock(ALL_TYPES=[])
+    )
+
+    # start_polling() always "succeeds" (returns) and the updater stays running,
+    # so the ONLY thing that can fail the attempt is the verify check.
+    updater = SimpleNamespace(
+        start_polling=AsyncMock(), stop=AsyncMock(), running=True
+    )
+    # bot present but without a real _request tuple, so the pool-drain step is a
+    # safe no-op (it catches the AttributeError and returns).
+    adapter._app = SimpleNamespace(updater=updater, bot=SimpleNamespace())
+    adapter._polling_error_callback_ref = MagicMock()
+
+    # Every awaited sleep marks a fresh 409 as having arrived. The handler
+    # clears the flag right before start_polling(), so only the post-start
+    # verify sleep leaves it set — exactly the "re-conflicted during verify"
+    # signal.
+    async def _sleep_marks_reconflict(*args, **kwargs):
+        adapter._polling_conflict_callback_received = True
+
+    monkeypatch.setattr(
+        "asyncio.sleep", AsyncMock(side_effect=_sleep_marks_reconflict)
+    )
+
+    await adapter._handle_polling_conflict(
+        type("Conflict", (Exception,), {})("terminated by other getUpdates request")
+    )
+
+    # The verify step detected the re-conflict, so the counter advanced (to 1)
+    # rather than resetting to 0, and recovery is still owned (not cleared).
+    assert adapter._polling_conflict_count == 1
+    assert adapter._recovery_in_progress is True
+    assert adapter.has_fatal_error is False
+
+    # A next attempt was scheduled; cancel it so it doesn't recurse under the
+    # instant-sleep mock and starve the test.
+    if adapter._polling_error_task and not adapter._polling_error_task.done():
+        adapter._polling_error_task.cancel()
+        try:
+            await adapter._polling_error_task
+        except (asyncio.CancelledError, Exception):
+            pass
+    await _cancel_heartbeat(adapter)
+
+
+@pytest.mark.asyncio
 async def test_connect_marks_retryable_fatal_error_for_startup_network_failure(monkeypatch):
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
 
