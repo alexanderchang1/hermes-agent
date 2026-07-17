@@ -418,6 +418,15 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_network_error_count: int = 0
         self._polling_error_callback_ref = None
         self._handling_polling_conflict: bool = False
+        # Single cross-path recovery guard. Both the 409-conflict handler and
+        # the network-error handler set this for the full duration of a
+        # recovery (across the whole retry ladder), and every recovery trigger
+        # — PTB's error callback, the polling heartbeat, the pending-updates
+        # probe, and the post-reconnect verifier — refuses to start a second,
+        # concurrent recovery while it is set. Without this, two recoveries
+        # race to call start_polling() and the loser raises "This Updater is
+        # already running!", which is then misread as a fresh 409 and loops.
+        self._recovery_in_progress: bool = False
         self._polling_heartbeat_task: Optional[asyncio.Task] = None
         # Consecutive heartbeat probes that saw queued updates the running
         # poller is not consuming. get_me() can't see this — the send path is
@@ -1017,6 +1026,18 @@ class TelegramAdapter(BasePlatformAdapter):
             or "terminated by other getupdates request" in text
             or "another bot instance is running" in text
         )
+
+    @property
+    def _recovery_active(self) -> bool:
+        """True while any polling recovery owns the updater.
+
+        Combines the explicit cross-path guard (`_recovery_in_progress`, set by
+        both the conflict and network handlers for the whole retry ladder) with
+        a still-running `_polling_error_task`. Every recovery trigger checks
+        this before starting a second, concurrent recovery.
+        """
+        task = self._polling_error_task
+        return self._recovery_in_progress or (task is not None and not task.done())
 
     @staticmethod
     def _looks_like_network_error(error: Exception) -> bool:
@@ -1843,6 +1864,13 @@ class TelegramAdapter(BasePlatformAdapter):
         BASE_DELAY = 5
         MAX_DELAY = 60
 
+        # Claim the shared recovery guard for the whole ladder (idempotent).
+        # Held across retries; cleared only on a clean reconnect or a fatal
+        # escalation. This is what stops the heartbeat / pending-updates probe
+        # / post-reconnect verifier from launching a second concurrent recovery
+        # while this one has the updater stopped mid-cycle.
+        self._recovery_in_progress = True
+
         self._polling_network_error_count += 1
         self._send_path_degraded = True
         attempt = self._polling_network_error_count
@@ -1891,6 +1919,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 self.name, attempt,
             )
             self._polling_network_error_count = 0
+            self._recovery_in_progress = False
             # start_polling() succeeding IS the recovery signal: the long-poll
             # connection is live again, so clear the degraded flag immediately
             # rather than blocking all outbound sends for the full
@@ -1986,9 +2015,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     "[%s] Polling heartbeat probe failed (%s); triggering reconnect",
                     self.name, probe_err,
                 )
-                if self._polling_error_task and not self._polling_error_task.done():
-                    continue   # reconnect already in progress
+                if self._recovery_active:
+                    continue   # a recovery already owns the updater
                 loop = asyncio.get_running_loop()
+                self._recovery_in_progress = True
                 self._polling_error_task = loop.create_task(
                     self._handle_polling_network_error(probe_err)
                 )
@@ -2027,7 +2057,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # A reconnect already in flight owns recovery — don't double-trigger,
         # and don't misread its brief stop()->start_polling() window (where
         # updater.running is transiently False) as a dead updater below.
-        if self._polling_error_task and not self._polling_error_task.done():
+        if self._recovery_active:
             self._polling_not_running_count = 0
             return
         updater = getattr(self._app, "updater", None) if self._app else None
@@ -2059,6 +2089,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.name,
                 )
                 loop = asyncio.get_running_loop()
+                self._recovery_in_progress = True
                 self._polling_error_task = loop.create_task(
                     self._handle_polling_network_error(
                         RuntimeError("Telegram updater stopped while in polling mode")
@@ -2093,6 +2124,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 self.name,
             )
             loop = asyncio.get_running_loop()
+            self._recovery_in_progress = True
             self._polling_error_task = loop.create_task(
                 self._handle_polling_network_error(
                     RuntimeError("getUpdates consumer wedged: pending updates not draining")
@@ -2125,6 +2157,13 @@ class TelegramAdapter(BasePlatformAdapter):
         if self.has_fatal_error:
             return
         if not (self._app and self._app.updater and self._app.updater.running):
+            if self._recovery_active:
+                # A recovery (conflict or network) already owns the updater —
+                # including its deliberate stop()->start_polling() window, which
+                # reads as "not running" here. Standing down avoids launching a
+                # racing reconnect that ends in "This Updater is already
+                # running!".
+                return
             logger.warning(
                 "[%s] Updater not running %ds after reconnect — treating as wedged",
                 self.name, HEARTBEAT_PROBE_DELAY,
@@ -2142,7 +2181,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[%s] Polling heartbeat probe failed %ds after reconnect: %s",
                 self.name, HEARTBEAT_PROBE_DELAY, probe_err,
             )
-            await self._handle_polling_network_error(probe_err)
+            if not self._recovery_active:
+                await self._handle_polling_network_error(probe_err)
 
     def _disarm_ptb_retry_loop(self) -> None:
         """Synchronously stop PTB's internal polling retry loop.
@@ -2231,6 +2271,11 @@ class TelegramAdapter(BasePlatformAdapter):
         # 409s and reach the fatal ceiling twice as fast).
         MAX_CONFLICT_RETRIES = 5
 
+        # Claim the shared recovery guard for the whole ladder (idempotent —
+        # the sync error callback may have already set it). Cleared only on a
+        # clean restart or a fatal escalation, never between retries.
+        self._recovery_in_progress = True
+
         self._polling_conflict_count += 1
 
         if self._polling_conflict_count > MAX_CONFLICT_RETRIES:
@@ -2305,6 +2350,7 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             self._polling_conflict_count = 0
             self._handling_polling_conflict = False
+            self._recovery_in_progress = False
             return
 
         except Exception as retry_err:
@@ -3035,22 +3081,31 @@ class TelegramAdapter(BasePlatformAdapter):
                         # Use _handling_polling_conflict as the definitive
                         # guard since it is written BEFORE the task is created,
                         # not by the task itself.
-                        if self._handling_polling_conflict:
+                        if self._recovery_in_progress:
                             self._polling_conflict_callback_received = True
                             return
                         # Mark a recovery in flight (sync, before the task is
-                        # created) so a second callback in the same tick returns
-                        # at the guard above instead of scheduling a duplicate
-                        # task. The retry counter is bumped inside
+                        # created) so a second callback in the same tick — or a
+                        # concurrent network-error recovery — returns at the
+                        # guard above instead of scheduling a duplicate task.
+                        # The retry counter is bumped inside
                         # _handle_polling_conflict (once per attempt) — not here
                         # — so the callback path and a direct call advance it
                         # identically.
                         self._handling_polling_conflict = True
+                        self._recovery_in_progress = True
                         self._polling_error_task = loop.create_task(self._handle_polling_conflict(error))
                         self._background_tasks.add(self._polling_error_task)
                         self._polling_error_task.add_done_callback(self._background_tasks.discard)
                     elif self._looks_like_network_error(error):
+                        # Same single-recovery guard as the conflict branch: if a
+                        # conflict OR network recovery is already running, don't
+                        # start a second one that would race it into a
+                        # "This Updater is already running!" self-conflict.
+                        if self._recovery_in_progress:
+                            return
                         logger.warning("[%s] Telegram network error, scheduling reconnect: %s", self.name, error)
+                        self._recovery_in_progress = True
                         self._polling_error_task = loop.create_task(self._handle_polling_network_error(error))
                         self._background_tasks.add(self._polling_error_task)
                         self._polling_error_task.add_done_callback(self._background_tasks.discard)
