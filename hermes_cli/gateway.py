@@ -4791,7 +4791,7 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         except Exception:
             pass  # best-effort; don't block gateway startup
 
-    from gateway.run import start_gateway
+    from gateway.run import start_gateway, _exit_after_graceful_shutdown
 
     print("┌─────────────────────────────────────────────────────────┐")
     print("│           ⚕ Hermes Gateway Starting...                 │")
@@ -4875,7 +4875,16 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
             code=getattr(e, "code", None),
             traceback=_traceback.format_exc(),
         )
-        raise
+        # #53107: route planned-restart / fatal-config SystemExit through the
+        # same os._exit backstop as gateway/run.py:main so a wedged non-daemon
+        # cron ThreadPoolExecutor worker cannot block interpreter finalization
+        # and strand a half-shut-down gateway.
+        _sx_code = e.code
+        if _sx_code is None:
+            _sx_code = 0
+        elif not isinstance(_sx_code, int):
+            _sx_code = 1
+        _exit_after_graceful_shutdown(_sx_code)
     except BaseException as e:
         # Absolutely everything else: Exception, asyncio.CancelledError,
         # even exotic BaseException subclasses. We want the cause logged.
@@ -4888,8 +4897,14 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         raise
     if not success:
         _exit_diag("gateway.exit_nonzero")
-        sys.exit(1)
+        _exit_after_graceful_shutdown(1)
     _exit_diag("gateway.exit_clean")
+    # #53107: force-exit after graceful teardown so cron's non-daemon
+    # ThreadPoolExecutor (atexit shutdown(wait=True)) cannot keep this logically
+    # stopped gateway alive — running stale code and interleaving logs with the
+    # replacement gateway — after its PID metadata is already released. Mirrors
+    # gateway/run.py:main's _exit_after_graceful_shutdown backstop.
+    _exit_after_graceful_shutdown(0)
 
 
 # =============================================================================
