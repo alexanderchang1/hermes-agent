@@ -2267,6 +2267,45 @@ def _parse_wake_gate(script_output: str) -> bool:
     return gate.get("wakeAgent", True) is not False
 
 
+def _load_prompt_file(prompt_file: str) -> "Optional[str]":
+    """Load a cron job's prompt body from a file under HERMES_HOME/scripts/.
+
+    Lets a job keep its prompt in a git-tracked file (single source of truth)
+    instead of an inline ``prompt`` string that silently drifts. Resolution and
+    path-traversal validation mirror ``_run_job_script`` — the file MUST reside
+    within HERMES_HOME/scripts/.
+
+    Returns the file contents on success, or None on any failure (missing file,
+    path escape, read error) so the caller can fall back to the inline prompt.
+    """
+    scripts_dir = _get_hermes_home() / "scripts"
+    scripts_dir_resolved = scripts_dir.resolve()
+
+    raw = Path(prompt_file).expanduser()
+    path = raw.resolve() if raw.is_absolute() else (scripts_dir / raw).resolve()
+
+    try:
+        path.relative_to(scripts_dir_resolved)
+    except ValueError:
+        logger.warning(
+            "Cron prompt_file %r resolves outside scripts dir (%s); "
+            "falling back to inline prompt.",
+            prompt_file,
+            scripts_dir_resolved,
+        )
+        return None
+
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning(
+            "Cron prompt_file %r unreadable (%s); falling back to inline prompt.",
+            prompt_file,
+            exc,
+        )
+        return None
+
+
 def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     """Build the effective prompt for a cron job, optionally loading one or more skills first.
 
@@ -2279,6 +2318,15 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             (if any) runs inline as before.
     """
     user_prompt = str(job.get("prompt") or "")
+    # A `prompt_file` (under HERMES_HOME/scripts/) is the single source of truth
+    # when present, overriding the inline `prompt`. This prevents the silent
+    # drift where a git-tracked prompt file is edited but the inline copy the
+    # scheduler actually runs is never updated.
+    prompt_file = job.get("prompt_file")
+    if prompt_file:
+        loaded = _load_prompt_file(str(prompt_file))
+        if loaded is not None:
+            user_prompt = loaded
     prompt = user_prompt
     skills = job.get("skills")
     # True when runtime-collected DATA (script stdout, upstream-job output)
