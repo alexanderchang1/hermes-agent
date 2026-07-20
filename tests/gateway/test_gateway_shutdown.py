@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -9,6 +10,161 @@ from gateway.platforms.base import MessageEvent
 from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
 from gateway.session import build_session_key
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
+
+
+@pytest.mark.asyncio
+async def test_start_gateway_failure_stops_cron_provider(monkeypatch, tmp_path):
+    """A gateway failure exit must not leave its cron owner running."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    provider_started = threading.Event()
+    provider_stopped = threading.Event()
+    provider_exited = threading.Event()
+    housekeeping_exited = threading.Event()
+    observed_stop_events = []
+
+    class _FailingRunner:
+        def __init__(self, config):
+            self.config = config
+            self.adapters = {}
+            self._running = True
+            self._draining = False
+            self._external_drain_active = False
+            self.should_exit_cleanly = False
+            self.should_exit_with_failure = True
+            self.exit_reason = "simulated gateway failure"
+            self.exit_code = None
+
+        async def start(self):
+            return True
+
+        async def wait_for_shutdown(self):
+            for _ in range(200):
+                if provider_started.is_set():
+                    return
+                await asyncio.sleep(0.01)
+            raise AssertionError("cron provider did not start")
+
+    class _CronProvider:
+        def start(self, stop_event, **_kwargs):
+            observed_stop_events.append(stop_event)
+            provider_started.set()
+            stop_event.wait()
+            provider_exited.set()
+
+        def stop(self):
+            provider_stopped.set()
+
+    def _housekeeping(stop_event, **_kwargs):
+        observed_stop_events.append(stop_event)
+        stop_event.wait()
+        housekeeping_exited.set()
+
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr("tools.skills_sync.sync_skills", lambda quiet=True: None)
+    monkeypatch.setattr("hermes_logging.setup_logging", lambda hermes_home, mode: tmp_path)
+    monkeypatch.setattr("hermes_logging._add_rotating_handler", lambda *args, **kwargs: None)
+    monkeypatch.setattr("gateway.run.GatewayRunner", _FailingRunner)
+    monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: _CronProvider())
+    monkeypatch.setattr("gateway.run._start_gateway_housekeeping", _housekeeping)
+    monkeypatch.setattr("hermes_cli.nous_auth_keepalive.start_nous_auth_keepalive", lambda: None)
+    monkeypatch.setattr("hermes_cli.nous_auth_keepalive.stop_nous_auth_keepalive", lambda: None)
+    monkeypatch.setattr("tools.mcp_tool.discover_mcp_tools", lambda: None)
+    monkeypatch.setattr("tools.mcp_tool.shutdown_mcp_servers", lambda: None)
+
+    ok = await gateway_run.start_gateway(
+        config=gateway_run.GatewayConfig(), replace=False, verbosity=None
+    )
+
+    # Let pytest exit cleanly on the pre-fix implementation, where the gateway
+    # never signals these daemon threads itself. Preserve the observed provider
+    # stop state so the assertion still proves the lifecycle bug.
+    provider_stop_was_called = provider_stopped.is_set()
+    assert observed_stop_events
+    observed_stop_events[0].set()
+    assert provider_exited.wait(2)
+    assert housekeeping_exited.wait(2)
+
+    assert ok is False
+    assert provider_stop_was_called
+
+
+@pytest.mark.asyncio
+async def test_start_gateway_housekeeping_start_failure_stops_cron_provider(
+    monkeypatch, tmp_path
+):
+    """A partial background-service startup must release the cron owner."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    provider_started = threading.Event()
+    provider_stopped = threading.Event()
+    provider_exited = threading.Event()
+    observed_stop_events = []
+    real_thread_class = threading.Thread
+
+    class _RunningRunner:
+        def __init__(self, config):
+            self.config = config
+            self.adapters = {}
+            self._running = True
+            self._draining = False
+            self._external_drain_active = False
+            self.should_exit_cleanly = False
+            self.should_exit_with_failure = False
+            self.exit_reason = None
+            self.exit_code = None
+
+        async def start(self):
+            return True
+
+        async def wait_for_shutdown(self):
+            raise AssertionError("shutdown wait must not run after startup failure")
+
+    class _CronProvider:
+        def start(self, stop_event, **_kwargs):
+            observed_stop_events.append(stop_event)
+            provider_started.set()
+            stop_event.wait()
+            provider_exited.set()
+
+        def stop(self):
+            provider_stopped.set()
+
+    class _UnstartableThread:
+        def start(self):
+            raise RuntimeError("simulated housekeeping thread start failure")
+
+        def is_alive(self):
+            return False
+
+    def _thread_factory(*args, **kwargs):
+        if kwargs.get("name") == "gateway-housekeeping":
+            return _UnstartableThread()
+        return real_thread_class(*args, **kwargs)
+
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr("tools.skills_sync.sync_skills", lambda quiet=True: None)
+    monkeypatch.setattr("hermes_logging.setup_logging", lambda hermes_home, mode: tmp_path)
+    monkeypatch.setattr("hermes_logging._add_rotating_handler", lambda *args, **kwargs: None)
+    monkeypatch.setattr("gateway.run.GatewayRunner", _RunningRunner)
+    monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: _CronProvider())
+    monkeypatch.setattr("gateway.run.threading.Thread", _thread_factory)
+    monkeypatch.setattr("hermes_cli.nous_auth_keepalive.start_nous_auth_keepalive", lambda: None)
+    monkeypatch.setattr("hermes_cli.nous_auth_keepalive.stop_nous_auth_keepalive", lambda: None)
+    monkeypatch.setattr("tools.mcp_tool.discover_mcp_tools", lambda: None)
+    monkeypatch.setattr("tools.mcp_tool.shutdown_mcp_servers", lambda: None)
+
+    with pytest.raises(RuntimeError, match="housekeeping thread start failure"):
+        await gateway_run.start_gateway(
+            config=gateway_run.GatewayConfig(), replace=False, verbosity=None
+        )
+
+    provider_stop_was_called = provider_stopped.is_set()
+    assert provider_started.wait(2)
+    assert observed_stop_events
+    observed_stop_events[0].set()
+    assert provider_exited.wait(2)
+    assert provider_stop_was_called
 
 
 @pytest.mark.asyncio

@@ -22072,75 +22072,89 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         cron_start_kwargs["can_dispatch"] = lambda: not (
             runner._draining or runner._external_drain_active
         )
-    cron_thread = threading.Thread(
-        target=cron_provider.start,
-        args=(cron_stop,),
-        kwargs=cron_start_kwargs,
-        daemon=True,
-        name="cron-scheduler",
-    )
-    cron_thread.start()
-
-    # Gateway-only periodic housekeeping (channel dir, cache cleanup, paste
-    # sweep, curator) — runs independently of which cron provider is active.
-    # Shares cron_stop as the shutdown signal.
-    housekeeping_thread = threading.Thread(
-        target=_start_gateway_housekeeping,
-        args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
-        daemon=True,
-        name="gateway-housekeeping",
-    )
-    housekeeping_thread.start()
-    
-    # Wait for shutdown
-    await runner.wait_for_shutdown()
+    cron_thread = None
+    housekeeping_thread = None
+    cron_thread_started = False
+    housekeeping_thread_started = False
 
     try:
-        from hermes_cli.nous_auth_keepalive import stop_nous_auth_keepalive
+        cron_thread = threading.Thread(
+            target=cron_provider.start,
+            args=(cron_stop,),
+            kwargs=cron_start_kwargs,
+            daemon=True,
+            name="cron-scheduler",
+        )
+        cron_thread.start()
+        cron_thread_started = True
 
-        stop_nous_auth_keepalive()
-    except Exception:
-        pass
+        # Gateway-only periodic housekeeping (channel dir, cache cleanup, paste
+        # sweep, curator) — runs independently of which cron provider is active.
+        # Shares cron_stop as the shutdown signal.
+        housekeeping_thread = threading.Thread(
+            target=_start_gateway_housekeeping,
+            args=(cron_stop,),
+            kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
+            daemon=True,
+            name="gateway-housekeeping",
+        )
+        housekeeping_thread.start()
+        housekeeping_thread_started = True
+
+        # Wait for shutdown. Cleanup belongs in the finally block because a
+        # failure exit must not leave this gateway's cron owner alive while a
+        # replacement gateway starts.
+        await runner.wait_for_shutdown()
+    finally:
+        try:
+            from hermes_cli.nous_auth_keepalive import stop_nous_auth_keepalive
+
+            stop_nous_auth_keepalive()
+        except Exception:
+            pass
+
+        # Stop cron scheduler + housekeeping cleanly.
+        #
+        # These MUST be awaited cooperatively, not join()ed. A cron delivery in
+        # flight when the gateway restarts is a coroutine scheduled onto THIS
+        # event loop (safe_schedule_threadsafe); the ticker thread is blocked on
+        # its future.result(). A synchronous cron_thread.join() would block the
+        # loop, so that delivery could never run — it timed out and the message
+        # was silently dropped (#58818). Awaiting keeps the loop alive so the
+        # pending delivery completes, then the ticker exits.
+        cron_stop.set()
+        if cron_thread_started:
+            try:
+                cron_provider.stop()
+            except Exception as e:
+                logger.debug("Cron provider stop() error: %s", e)
+            if not await _await_thread_exit(
+                cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT
+            ):
+                logger.warning(
+                    "Cron ticker did not exit within %.0fs of shutdown — an in-flight "
+                    "delivery may have been dropped.", _CRON_SHUTDOWN_DRAIN_TIMEOUT,
+                )
+        if housekeeping_thread_started:
+            await _await_thread_exit(
+                housekeeping_thread, timeout=_HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT
+            )
+
+        # Stop the planned-stop watcher (daemon=True so this is belt-and-suspenders).
+        _planned_stop_watcher_stop.set()
+        _planned_stop_watcher_thread.join(timeout=2)
+
+        # Close MCP server connections
+        try:
+            from tools.mcp_tool import shutdown_mcp_servers
+            shutdown_mcp_servers()
+        except Exception:
+            pass
 
     if runner.should_exit_with_failure:
         if runner.exit_reason:
             logger.error("Gateway exiting with failure: %s", runner.exit_reason)
         return False
-    
-    # Stop cron scheduler + housekeeping cleanly.
-    #
-    # These MUST be awaited cooperatively, not join()ed. A cron delivery in
-    # flight when the gateway restarts is a coroutine scheduled onto THIS event
-    # loop (safe_schedule_threadsafe); the ticker thread is blocked on its
-    # future.result(). A synchronous cron_thread.join() would block the loop,
-    # so that delivery could never run — it timed out and the message was
-    # silently dropped (#58818). Awaiting keeps the loop alive so the in-flight
-    # delivery finishes before we tear down.
-    cron_stop.set()
-    try:
-        cron_provider.stop()
-    except Exception as e:
-        logger.debug("Cron provider stop() error: %s", e)
-    if not await _await_thread_exit(cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT):
-        logger.warning(
-            "Cron ticker did not exit within %.0fs of shutdown — an in-flight "
-            "delivery may have been dropped.", _CRON_SHUTDOWN_DRAIN_TIMEOUT,
-        )
-    await _await_thread_exit(
-        housekeeping_thread, timeout=_HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT
-    )
-
-    # Stop the planned-stop watcher (daemon=True so this is belt-and-suspenders).
-    _planned_stop_watcher_stop.set()
-    _planned_stop_watcher_thread.join(timeout=2)
-
-    # Close MCP server connections
-    try:
-        from tools.mcp_tool import shutdown_mcp_servers
-        shutdown_mcp_servers()
-    except Exception:
-        pass
 
     if runner.exit_code is not None:
         raise SystemExit(runner.exit_code)
