@@ -484,6 +484,11 @@ class EmailAdapter(BasePlatformAdapter):
         cache_dir = os.path.expanduser("~/.hermes/cache")
         os.makedirs(cache_dir, exist_ok=True)
         self._completed_uids_path = os.path.join(cache_dir, "email-completed-uids.json")
+        # Persist FETCHED UIDs too (not just fully-dispatched). Without this the
+        # in-memory _seen_uids resets to the tiny completed set on every restart,
+        # so the poll re-SEARCH-ALLs + re-fetches the whole INBOX each time — the
+        # driver of the IMAP "read operation timed out" storm.
+        self._seen_uids_path = os.path.join(cache_dir, "email-seen-uids.json")
 
         # ── Email-triggered workflows ───────────────────────────────────────
         # Each workflow defines a subject_prefix, allowed_senders, and a
@@ -606,6 +611,29 @@ class EmailAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("[Email] Failed to persist completed UID: %s", e)
 
+    def _load_seen_uids(self) -> set:
+        """Load the set of already-fetched message UIDs from disk (str form)."""
+        try:
+            with open(self._seen_uids_path) as f:
+                return set(json.load(f))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return set()
+
+    def _save_seen_uids(self) -> None:
+        """Persist fetched UIDs so a restart doesn't re-scan the whole INBOX.
+
+        Stored as strings; bounded to the most recent 5000. Best-effort — a
+        write failure only costs an extra re-scan, never correctness.
+        """
+        try:
+            uids = [u.decode() if isinstance(u, bytes) else str(u) for u in self._seen_uids]
+            uids = sorted(uids, key=int)[-5000:]
+            os.makedirs(os.path.dirname(self._seen_uids_path), exist_ok=True)
+            with open(self._seen_uids_path, "w") as f:
+                json.dump(uids, f)
+        except Exception as e:
+            logger.warning("[Email] Failed to persist seen UIDs: %s", e)
+
     def _connect_smtp(self) -> smtplib.SMTP:
         """Create an SMTP connection, selecting the correct protocol for the port.
 
@@ -675,8 +703,15 @@ class EmailAdapter(BasePlatformAdapter):
 
         # ── 1. Load completed UIDs from persistent store ──
         completed_uids = self._load_completed_uids()
-        logger.info("[Email] Loaded %d completed message UIDs", len(completed_uids))
-        self._seen_uids = {u.encode() if isinstance(u, str) else u for u in completed_uids}
+        seen_uids = self._load_seen_uids()
+        logger.info(
+            "[Email] Loaded %d completed + %d seen message UIDs",
+            len(completed_uids), len(seen_uids),
+        )
+        self._seen_uids = {
+            u.encode() if isinstance(u, str) else u
+            for u in (completed_uids | seen_uids)
+        }
         self._trim_seen_uids()
 
         loop = asyncio.get_running_loop()
@@ -913,6 +948,7 @@ class EmailAdapter(BasePlatformAdapter):
         results = []
         try:
             imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
+            new_uid_seen = False
             try:
                 imap.login(self._address, self._password)
                 _send_imap_id(imap)
@@ -926,11 +962,22 @@ class EmailAdapter(BasePlatformAdapter):
                     if uid in self._seen_uids:
                         continue
                     self._seen_uids.add(uid)
+                    new_uid_seen = True
                     # Trim periodically to prevent unbounded memory growth
                     if len(self._seen_uids) > self._seen_uids_max:
                         self._trim_seen_uids()
 
-                    status, msg_data = imap.uid("fetch", uid, "(RFC822)")
+                    # A single slow/large message must not abort the whole
+                    # batch: on a socket read timeout (or any fetch error) log
+                    # and skip this UID so the remaining messages still process.
+                    # The UID stays in _seen_uids so we don't re-storm it.
+                    try:
+                        status, msg_data = imap.uid("fetch", uid, "(RFC822)")
+                    except Exception as e:
+                        logger.warning(
+                            "[Email] Fetch failed for UID %s (%s), skipping", uid, e
+                        )
+                        continue
                     if status != "OK":
                         continue
 
@@ -1002,6 +1049,9 @@ class EmailAdapter(BasePlatformAdapter):
                     imap.logout()
                 except Exception:
                     pass
+                # Persist fetched UIDs so a restart won't re-scan the whole INBOX.
+                if new_uid_seen:
+                    self._save_seen_uids()
         except Exception as e:
             logger.error("[Email] IMAP fetch error: %s", e)
         return results
