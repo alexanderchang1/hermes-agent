@@ -720,9 +720,16 @@ def _backup_db_file(db_path: Path) -> Optional[Path]:
     Raw file copy on purpose: the DB won't open cleanly, so we preserve the
     bytes exactly for forensics / manual restore. WAL and SHM sidecars are
     copied too when present. Returns the backup path, or None on failure.
+
+    Retention: keeps only the newest ``_BACKUP_KEEP`` malformed backups (plus
+    their sidecars) beside the DB. These are full-size copies of a multi-GB
+    state.db; without a cap a nightly corrupt-detect loop silently filled the
+    /ihome 75 GB quota with ~2 GB/day (see ihome-quota-layout memory).
     """
     import datetime
     import shutil
+
+    _BACKUP_KEEP = 2
 
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = db_path.with_name(f"{db_path.name}.malformed-backup-{stamp}")
@@ -732,10 +739,27 @@ def _backup_db_file(db_path: Path) -> Optional[Path]:
             sidecar = db_path.with_name(db_path.name + suffix)
             if sidecar.exists():
                 shutil.copy2(sidecar, backup_path.with_name(backup_path.name + suffix))
-        return backup_path
     except Exception as exc:  # pragma: no cover - best effort
         logger.warning("Could not back up malformed DB %s: %s", db_path, exc)
         return None
+
+    # Prune old backups: keep the newest _BACKUP_KEEP mains + their sidecars.
+    try:
+        prefix = f"{db_path.name}.malformed-backup-"
+        mains = sorted(
+            p for p in db_path.parent.glob(prefix + "*")
+            if not p.name.endswith(("-wal", "-shm"))
+        )
+        for old in mains[:-_BACKUP_KEEP]:
+            for victim in (old, Path(str(old) + "-wal"), Path(str(old) + "-shm")):
+                try:
+                    victim.unlink()
+                except FileNotFoundError:
+                    pass
+    except Exception as exc:  # pragma: no cover - best effort
+        logger.warning("Could not prune old DB backups beside %s: %s", db_path, exc)
+
+    return backup_path
 
 
 def _db_opens_cleanly(db_path: Path) -> Optional[str]:
